@@ -15,9 +15,10 @@ anticipatory trajectories.
 from __future__ import annotations
 
 import math
+import random
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -540,3 +541,667 @@ class DroneAgent:
     @property
     def waypoints_remaining(self) -> int:
         return self._buffer.remaining if self._buffer else 0
+
+
+# ---------------------------------------------------------------------------
+# Rollout buffer  (PPO experience storage + GAE)
+# ---------------------------------------------------------------------------
+
+class RolloutBuffer:
+    """
+    Stores one epoch of on-policy transitions and computes GAE advantages.
+
+    Replay buffers vs rollout buffers
+    ──────────────────────────────────
+    • **Replay buffer** (off-policy, e.g. SAC / DDPG):
+      Large circular buffer that keeps *all* past transitions.  Mini-batches
+      are sampled uniformly (or by priority) regardless of which policy
+      collected them.
+
+    • **Rollout buffer** (on-policy, e.g. PPO / A2C):
+      Fixed-length buffer that stores *one trajectory* collected by the
+      **current** policy.  After the PPO update the data is discarded
+      because stale experience would bias the on-policy gradient.
+
+    This class implements the rollout (on-policy) variant, which is the
+    correct one for PPO.
+
+    Workflow
+    --------
+    1.  ``reset()`` at the start of each rollout.
+    2.  ``store(...)`` after every env step.
+    3.  ``finish(last_value)`` once the rollout is full — computes returns &
+        GAE advantages.
+    4.  Iterate with ``sample_batches(batch_size)`` during PPO updates.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        cam_shape: Tuple[int, int, int],
+        imu_dim: int,
+        wp_dim: int,
+        action_dim: int,
+        device: str = "cpu",
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+    ):
+        """
+        Args:
+            buffer_size: Number of transitions to collect per rollout epoch.
+            cam_shape:   (C, H, W) of the camera observation.
+            imu_dim:     Dimensionality of the IMU vector (default 6).
+            wp_dim:      Dimensionality of the flattened waypoint vector (default 6).
+            action_dim:  Dimensionality of the action (default 4).
+            device:      "cpu" or "cuda".
+            gamma:       Discount factor.
+            gae_lambda:  GAE λ for bias–variance trade-off.
+        """
+        self.buffer_size = buffer_size
+        self.device = torch.device(device)
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+
+        # ----- pre-allocate storage ------------------------------------------
+        self.cam       = torch.zeros(buffer_size, *cam_shape, device=self.device)
+        self.imu       = torch.zeros(buffer_size, imu_dim,    device=self.device)
+        self.waypoints = torch.zeros(buffer_size, wp_dim,     device=self.device)
+        self.actions   = torch.zeros(buffer_size, action_dim, device=self.device)
+        self.log_probs = torch.zeros(buffer_size,             device=self.device)
+        self.rewards   = torch.zeros(buffer_size,             device=self.device)
+        self.values    = torch.zeros(buffer_size,             device=self.device)
+        self.dones     = torch.zeros(buffer_size,             device=self.device)
+
+        # ----- computed after finish() ---------------------------------------
+        self.advantages = torch.zeros(buffer_size, device=self.device)
+        self.returns    = torch.zeros(buffer_size, device=self.device)
+
+        self.ptr = 0
+        self.full = False
+
+    # ----- storage --------------------------------------------------------
+
+    def reset(self) -> None:
+        """Clear the buffer for a new rollout epoch."""
+        self.ptr = 0
+        self.full = False
+
+    def store(
+        self,
+        cam: torch.Tensor,
+        imu: torch.Tensor,
+        waypoints: torch.Tensor,
+        action: torch.Tensor,
+        log_prob: torch.Tensor,
+        reward: float,
+        value: torch.Tensor,
+        done: bool,
+    ) -> None:
+        """
+        Append a single transition.
+
+        All tensor inputs should already be on ``self.device`` and have no
+        batch dimension (i.e. squeezed to 1-D / 3-D for cam).
+        """
+        assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
+
+        i = self.ptr
+        self.cam[i]       = cam
+        self.imu[i]       = imu
+        self.waypoints[i] = waypoints
+        self.actions[i]   = action
+        self.log_probs[i] = log_prob
+        self.rewards[i]   = reward
+        self.values[i]    = value.squeeze()
+        self.dones[i]     = float(done)
+        self.ptr += 1
+
+        if self.ptr == self.buffer_size:
+            self.full = True
+
+    # ----- GAE computation ------------------------------------------------
+
+    def finish(self, last_value: torch.Tensor) -> None:
+        """
+        Call after the rollout is complete (buffer full **or** episode ended).
+
+        Computes Generalised Advantage Estimation (GAE-λ) and discounted
+        returns for every stored transition.
+
+        Args:
+            last_value: V(s_{T+1}) — the critic's estimate for the state
+                        *after* the last stored transition. Pass 0 if the
+                        episode terminated.
+        """
+        n = self.ptr  # may be < buffer_size if episode ended early
+        last_gae = 0.0
+        last_val = last_value.squeeze().item()
+
+        for t in reversed(range(n)):
+            if t == n - 1:
+                next_non_terminal = 1.0 - self.dones[t].item()
+                next_value = last_val
+            else:
+                next_non_terminal = 1.0 - self.dones[t].item()
+                next_value = self.values[t + 1].item()
+
+            delta = (self.rewards[t].item()
+                     + self.gamma * next_value * next_non_terminal
+                     - self.values[t].item())
+            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            self.advantages[t] = last_gae
+
+        self.returns[:n] = self.advantages[:n] + self.values[:n]
+
+        # Normalise advantages (variance reduction)
+        adv = self.advantages[:n]
+        self.advantages[:n] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+    # ----- mini-batch sampling --------------------------------------------
+
+    def sample_batches(
+        self,
+        batch_size: int,
+    ):
+        """
+        Yield shuffled mini-batches of ``batch_size`` from the filled buffer.
+
+        Each yielded dict contains the same keys the policy expects plus
+        ``"actions"``, ``"old_log_probs"``, ``"advantages"``, ``"returns"``.
+        """
+        n = self.ptr
+        indices = torch.randperm(n, device=self.device)
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            idx = indices[start:end]
+
+            yield {
+                "obs": {
+                    "cam":       self.cam[idx],
+                    "imu":       self.imu[idx],
+                    "waypoints": self.waypoints[idx],
+                },
+                "actions":       self.actions[idx],
+                "old_log_probs": self.log_probs[idx],
+                "advantages":    self.advantages[idx],
+                "returns":       self.returns[idx],
+            }
+
+
+# ---------------------------------------------------------------------------
+# PPO Trainer
+# ---------------------------------------------------------------------------
+
+class PPOTrainer:
+    """
+    Proximal Policy Optimisation trainer that ties the rollout buffer, the
+    policy, and the update loop together.
+
+    Usage
+    -----
+    >>> cfg   = ModelConfig()
+    >>> agent = DroneAgent(cfg, route=route, device="cuda")
+    >>> trainer = PPOTrainer(agent, cfg)
+    >>>
+    >>> for epoch in range(num_epochs):
+    ...     trainer.collect_rollout(env)
+    ...     stats = trainer.update()
+    ...     print(stats)
+    """
+
+    def __init__(
+        self,
+        agent: DroneAgent,
+        cfg: ModelConfig | None = None,
+        rollout_steps: int = 2048,
+        batch_size: int = 64,
+        ppo_epochs: int = 10,
+    ):
+        self.agent = agent
+        self.cfg = cfg or agent.cfg
+        self.rollout_steps = rollout_steps
+        self.batch_size = batch_size
+        self.ppo_epochs = ppo_epochs
+
+        device = str(agent.device)
+        cam_shape = (self.cfg.cam_channels, self.cfg.cam_height, self.cfg.cam_width)
+        wp_dim = self.cfg.waypoint_dim * self.cfg.num_waypoints
+
+        self.buffer = RolloutBuffer(
+            buffer_size=rollout_steps,
+            cam_shape=cam_shape,
+            imu_dim=self.cfg.imu_dim,
+            wp_dim=wp_dim,
+            action_dim=self.cfg.action_dim,
+            device=device,
+            gamma=self.cfg.gamma,
+            gae_lambda=self.cfg.gae_lambda,
+        )
+
+        self.optimiser = torch.optim.Adam(
+            agent.policy.parameters(), lr=self.cfg.lr,
+        )
+
+    # ----- rollout collection ---------------------------------------------
+
+    def collect_rollout(self, env) -> dict:
+        """
+        Run the current policy in ``env`` for ``rollout_steps`` transitions
+        and fill the rollout buffer.
+
+        ``env`` must expose:
+            - ``reset() -> obs``
+            - ``step(action) -> (obs, reward, done, info)``
+
+        where ``obs`` is a dict with keys ``"cam"``, ``"imu"``,
+        ``"drone_pos"``.
+
+        Returns:
+            info dict with ``total_reward`` and ``episodes_completed``.
+        """
+        self.buffer.reset()
+        obs = env.reset()
+        total_reward = 0.0
+        episodes = 0
+
+        for _ in range(self.rollout_steps):
+            # --- prepare tensors (single-step, no batch) ---------------------
+            cam, imu, wp_tensor = self._obs_to_tensors(obs)
+
+            policy_obs = {
+                "cam": cam.unsqueeze(0),
+                "imu": imu.unsqueeze(0),
+                "waypoints": wp_tensor,
+            }
+            action, log_prob, value = self.agent.policy.act(policy_obs)
+            action_sq = action.squeeze(0)
+
+            # --- environment step --------------------------------------------
+            action_np = action_sq.cpu()
+            next_obs, reward, done, info = env.step(action_np)
+
+            # --- store -------------------------------------------------------
+            self.buffer.store(
+                cam=cam,
+                imu=imu,
+                waypoints=wp_tensor.squeeze(0),
+                action=action_sq,
+                log_prob=log_prob.squeeze(0),
+                reward=float(reward),
+                value=value,
+                done=done,
+            )
+            total_reward += float(reward)
+
+            if done:
+                obs = env.reset()
+                episodes += 1
+            else:
+                obs = next_obs
+
+        # --- bootstrap last value --------------------------------------------
+        cam, imu, wp_tensor = self._obs_to_tensors(obs)
+        with torch.no_grad():
+            policy_obs = {
+                "cam": cam.unsqueeze(0),
+                "imu": imu.unsqueeze(0),
+                "waypoints": wp_tensor,
+            }
+            _, _, last_value = self.agent.policy.act(policy_obs)
+        self.buffer.finish(last_value)
+
+        return {"total_reward": total_reward, "episodes_completed": episodes}
+
+    # ----- PPO update -----------------------------------------------------
+
+    def update(self) -> dict:
+        """
+        Run ``ppo_epochs`` of clipped PPO over the filled rollout buffer.
+
+        Returns:
+            dict with ``policy_loss``, ``value_loss``, ``entropy``,
+            ``approx_kl``.
+        """
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_kl = 0.0
+        num_batches = 0
+
+        for _ in range(self.ppo_epochs):
+            for batch in self.buffer.sample_batches(self.batch_size):
+                obs = batch["obs"]
+                actions = batch["actions"]
+                old_log_probs = batch["old_log_probs"]
+                advantages = batch["advantages"]
+                returns = batch["returns"]
+
+                # Re-evaluate under current policy
+                new_log_probs, entropy, values = (
+                    self.agent.policy.evaluate_actions(obs, actions)
+                )
+                values = values.squeeze(-1)
+
+                # --- policy (actor) loss -----------------------------------
+                ratio = (new_log_probs - old_log_probs).exp()
+                surr1 = ratio * advantages
+                surr2 = (
+                    torch.clamp(ratio, 1.0 - self.cfg.clip_eps,
+                                1.0 + self.cfg.clip_eps)
+                    * advantages
+                )
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # --- value (critic) loss -----------------------------------
+                value_loss = F.mse_loss(values, returns)
+
+                # --- total loss --------------------------------------------
+                loss = (policy_loss
+                        + self.cfg.value_coef * value_loss
+                        - self.cfg.entropy_coef * entropy.mean())
+
+                self.optimiser.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    self.agent.policy.parameters(), self.cfg.max_grad_norm,
+                )
+                self.optimiser.step()
+
+                # --- logging -----------------------------------------------
+                with torch.no_grad():
+                    approx_kl = (old_log_probs - new_log_probs).mean().item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss  += value_loss.item()
+                total_entropy     += entropy.mean().item()
+                total_kl          += approx_kl
+                num_batches       += 1
+
+        n = max(num_batches, 1)
+        return {
+            "policy_loss": total_policy_loss / n,
+            "value_loss":  total_value_loss / n,
+            "entropy":     total_entropy / n,
+            "approx_kl":   total_kl / n,
+        }
+
+    # ----- helpers --------------------------------------------------------
+
+    def _obs_to_tensors(self, obs: dict):
+        """Convert a raw env obs dict to device tensors (no batch dim)."""
+        device = self.agent.device
+
+        cam = obs["cam"]
+        if not isinstance(cam, torch.Tensor):
+            cam = torch.as_tensor(cam, dtype=torch.float32)
+        if cam.ndim == 3 and cam.shape[-1] in (1, 3):
+            cam = cam.permute(2, 0, 1)
+        if cam.max() > 1.0:
+            cam = cam / 255.0
+        cam = cam.to(device)
+
+        imu = obs["imu"]
+        if not isinstance(imu, torch.Tensor):
+            imu = torch.as_tensor(imu, dtype=torch.float32)
+        imu = imu.to(device)
+
+        drone_pos = tuple(float(x) for x in obs["drone_pos"][:3])
+        wp_tensor = self.agent._buffer.current_targets_tensor(
+            drone_pos, device=device,
+        )
+        return cam, imu, wp_tensor
+
+
+# ---------------------------------------------------------------------------
+# Curriculum  — progressive route difficulty
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CurriculumStage:
+    """Defines one difficulty level in the training curriculum."""
+    name: str
+    num_waypoints: int          # how many WPs per episode
+    min_spacing: float          # minimum distance between consecutive WPs (m)
+    max_spacing: float          # maximum distance
+    max_angle_deg: float        # max heading change between consecutive WPs
+    safety_radius: float        # waypoint reach threshold (can relax early on)
+    altitude_range: Tuple[float, float] = (3.0, 7.0)   # (min_z, max_z)
+    success_threshold: float = 0.8   # fraction of WPs reached to "pass"
+    min_episodes: int = 50           # minimum episodes before promotion
+
+
+class CurriculumScheduler:
+    """
+    Manages a sequence of ``CurriculumStage``s and promotes the agent when
+    it consistently succeeds at the current level.
+
+    Design rationale
+    ────────────────
+    Early stages use **short, straight, 2-waypoint routes** so the policy
+    first learns to fly toward a single target.  Later stages add more
+    waypoints, sharper turns, and tighter safety radii, forcing the agent
+    to exploit the two-waypoint look-ahead for smooth path planning.
+
+    Usage
+    -----
+    >>> curriculum = CurriculumScheduler.default()
+    >>> for epoch in range(total_epochs):
+    ...     route = curriculum.generate_route()
+    ...     agent.set_route(route)
+    ...     agent.cfg.safety_radius = curriculum.current_stage.safety_radius
+    ...     # ... run episode ...
+    ...     curriculum.report(waypoints_reached, total_waypoints)
+    ...     if curriculum.finished:
+    ...         break
+    """
+
+    def __init__(
+        self,
+        stages: List[CurriculumStage],
+        window_size: int = 50,
+        on_promote: Optional[Callable[[CurriculumStage, CurriculumStage], None]] = None,
+    ):
+        """
+        Args:
+            stages:      Ordered list of difficulty stages.
+            window_size: Rolling window for success-rate computation.
+            on_promote:  Optional callback ``(old_stage, new_stage)`` called
+                         on every promotion.
+        """
+        assert len(stages) >= 1
+        self._stages = stages
+        self._idx = 0
+        self._window_size = window_size
+        self._on_promote = on_promote
+
+        # Rolling history of (reached, total) per episode
+        self._history: deque[Tuple[int, int]] = deque(maxlen=window_size)
+        self._total_episodes = 0
+
+    # ----- properties -----------------------------------------------------
+
+    @property
+    def current_stage(self) -> CurriculumStage:
+        return self._stages[self._idx]
+
+    @property
+    def stage_index(self) -> int:
+        return self._idx
+
+    @property
+    def num_stages(self) -> int:
+        return len(self._stages)
+
+    @property
+    def finished(self) -> bool:
+        """True once the agent has graduated from the final stage."""
+        return self._idx >= len(self._stages)
+
+    @property
+    def success_rate(self) -> float:
+        """Rolling fraction of waypoints reached over recent episodes."""
+        if not self._history:
+            return 0.0
+        reached = sum(r for r, _ in self._history)
+        total = sum(t for _, t in self._history)
+        return reached / max(total, 1)
+
+    # ----- route generation -----------------------------------------------
+
+    def generate_route(
+        self,
+        start: Tuple[float, float, float] = (0.0, 0.0, 5.0),
+    ) -> List[Tuple[float, float, float]]:
+        """
+        Build a random route that respects the current stage constraints.
+
+        Args:
+            start: The drone's spawn / take-off position.
+
+        Returns:
+            List of (x, y, z) waypoints (length = stage.num_waypoints).
+        """
+        stage = self.current_stage
+        route: List[Tuple[float, float, float]] = []
+        prev = start
+        heading = random.uniform(0.0, 2.0 * math.pi)
+
+        for _ in range(stage.num_waypoints):
+            dist = random.uniform(stage.min_spacing, stage.max_spacing)
+            max_delta = math.radians(stage.max_angle_deg)
+            heading += random.uniform(-max_delta, max_delta)
+
+            x = prev[0] + dist * math.cos(heading)
+            y = prev[1] + dist * math.sin(heading)
+            z = random.uniform(*stage.altitude_range)
+            wp = (x, y, z)
+
+            route.append(wp)
+            prev = wp
+
+        return route
+
+    # ----- episode reporting & promotion ----------------------------------
+
+    def report(self, waypoints_reached: int, total_waypoints: int) -> bool:
+        """
+        Report the outcome of one episode.
+
+        Args:
+            waypoints_reached: How many WPs the drone reached.
+            total_waypoints:   Total WPs in the route.
+
+        Returns:
+            True if the agent was promoted to the next stage this call.
+        """
+        if self.finished:
+            return False
+
+        self._history.append((waypoints_reached, total_waypoints))
+        self._total_episodes += 1
+
+        promoted = False
+        stage = self.current_stage
+        if (len(self._history) >= stage.min_episodes
+                and self.success_rate >= stage.success_threshold):
+            promoted = self._promote()
+
+        return promoted
+
+    def _promote(self) -> bool:
+        old = self.current_stage
+        self._idx += 1
+        self._history.clear()
+
+        if self.finished:
+            return True
+
+        new = self.current_stage
+        if self._on_promote is not None:
+            self._on_promote(old, new)
+        return True
+
+    # ----- summary --------------------------------------------------------
+
+    def status_dict(self) -> Dict[str, object]:
+        """Snapshot for logging / TensorBoard."""
+        stage = self.current_stage if not self.finished else self._stages[-1]
+        return {
+            "curriculum/stage_index": self._idx,
+            "curriculum/stage_name": stage.name,
+            "curriculum/success_rate": round(self.success_rate, 3),
+            "curriculum/total_episodes": self._total_episodes,
+            "curriculum/finished": self.finished,
+        }
+
+    # ----- built-in presets -----------------------------------------------
+
+    @classmethod
+    def default(
+        cls,
+        window_size: int = 50,
+        on_promote: Optional[Callable] = None,
+    ) -> "CurriculumScheduler":
+        """
+        A sensible 5-stage curriculum:
+
+        1. **Hover→Point**   – 2 WPs, short & straight, generous radius.
+        2. **Short legs**     – 3 WPs, gentle turns.
+        3. **Medium legs**    – 4 WPs, moderate turns & tighter radius.
+        4. **Long & twisty**  – 6 WPs, sharp turns.
+        5. **Full mission**   – 8 WPs, tight radius, any angle.
+        """
+        stages = [
+            CurriculumStage(
+                name="hover_to_point",
+                num_waypoints=2,
+                min_spacing=3.0,
+                max_spacing=6.0,
+                max_angle_deg=15.0,
+                safety_radius=2.0,
+                success_threshold=0.75,
+                min_episodes=30,
+            ),
+            CurriculumStage(
+                name="short_legs",
+                num_waypoints=3,
+                min_spacing=4.0,
+                max_spacing=8.0,
+                max_angle_deg=30.0,
+                safety_radius=1.5,
+                success_threshold=0.80,
+                min_episodes=50,
+            ),
+            CurriculumStage(
+                name="medium_legs",
+                num_waypoints=4,
+                min_spacing=5.0,
+                max_spacing=12.0,
+                max_angle_deg=60.0,
+                safety_radius=1.2,
+                success_threshold=0.80,
+                min_episodes=50,
+            ),
+            CurriculumStage(
+                name="long_and_twisty",
+                num_waypoints=6,
+                min_spacing=6.0,
+                max_spacing=15.0,
+                max_angle_deg=90.0,
+                safety_radius=1.0,
+                success_threshold=0.80,
+                min_episodes=80,
+            ),
+            CurriculumStage(
+                name="full_mission",
+                num_waypoints=8,
+                min_spacing=5.0,
+                max_spacing=20.0,
+                max_angle_deg=120.0,
+                safety_radius=0.8,
+                altitude_range=(2.0, 10.0),
+                success_threshold=0.85,
+                min_episodes=100,
+            ),
+        ]
+        return cls(stages, window_size=window_size, on_promote=on_promote)
