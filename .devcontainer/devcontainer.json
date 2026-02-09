@@ -1,0 +1,115 @@
+// ============================================================
+// Dev Container — PX4 · ROS 2 Humble · Gazebo Harmonic · PyTorch CUDA
+// ============================================================
+{
+  "name": "PX4 ROS2 RL",
+
+  // ── Build via docker-compose (for GPU + display setup) ──
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+
+  // ── User ────────────────────────────────────────────────
+  "remoteUser": "dev",
+  "containerUser": "dev",
+
+  // ── Features (lightweight additions) ────────────────────
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": false
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+
+  // ── Lifecycle scripts ───────────────────────────────────
+  "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
+
+  // ── VS Code settings ───────────────────────────────────
+  "customizations": {
+    "vscode": {
+      "settings": {
+        // Python
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "python.analysis.typeCheckingMode": "basic",
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter",
+          "editor.formatOnSave": true
+        },
+        // C++ (PX4 / ROS 2)
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+        "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+        // CMake
+        "cmake.configureOnOpen": false,
+        // ROS
+        "ros.distro": "humble",
+        // Terminal
+        "terminal.integrated.defaultProfile.linux": "bash",
+        // Files
+        "files.associations": {
+          "*.launch.py": "python",
+          "*.world": "xml",
+          "*.sdf": "xml",
+          "*.xacro": "xml",
+          "*.urdf": "xml"
+        },
+        "files.watcherExclude": {
+          "**/build/**": true,
+          "**/install/**": true,
+          "**/log/**": true
+        },
+        "search.exclude": {
+          "**/build": true,
+          "**/install": true,
+          "**/log": true
+        }
+      },
+      "extensions": [
+        // Python
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.debugpy",
+        // C/C++
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        // ROS
+        "ms-iot.vscode-ros",
+        // XML (URDF/SDF/launch)
+        "redhat.vscode-xml",
+        // Docker
+        "ms-azuretools.vscode-docker",
+        // Git
+        "eamodio.gitlens",
+        // Jupyter (for RL experiments)
+        "ms-toolsai.jupyter",
+        // Misc
+        "streetsidesoftware.code-spell-checker",
+        "ms-vscode.live-server"
+      ]
+    }
+  },
+
+  // ── Port forwarding (useful if not using host networking) ─
+  "forwardPorts": [
+    14540,  // PX4 MAVLINK (UDP)
+    14550,  // QGroundControl
+    8765,   // Micro XRCE-DDS Agent
+    6006,   // TensorBoard
+    11345   // Gazebo transport
+  ],
+
+  // ── Mounts ──────────────────────────────────────────────
+  "mounts": [
+    // Persist bash history
+    "type=volume,source=devcontainer-bashhistory,target=/home/dev/.bash_history_vol"
+  ],
+
+  // ── Run arguments ──────────────────────────────────────
+  "runArgs": [
+    "--env-file", ".devcontainer/.env"
+  ],
+
+  // ── Shut down action ────────────────────────────────────
+  "shutdownAction": "stopCompose"
+}
