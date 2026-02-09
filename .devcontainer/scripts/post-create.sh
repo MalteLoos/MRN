@@ -11,6 +11,7 @@ echo "🚀  Running post-create setup …"
 sudo chown -R "$(id -u):$(id -g)" \
     "${HOME}/.ros" \
     "${HOME}/.ccache" \
+    "${HOME}/.local/share/QGroundControl" \
     2>/dev/null || true
 
 # ── 1. rosdep update (runs as non-root) ────────────────────

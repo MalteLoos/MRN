@@ -73,6 +73,8 @@ services:
       # Persistent caches across rebuilds
       - px4-ccache:/home/dev/.ccache
       - ros-log:/home/dev/.ros/log
+      # QGroundControl settings & mission files
+      - qgc-config:/home/dev/.local/share/QGroundControl
 
     # Keep container alive for VS Code attach
     stdin_open: true
@@ -81,3 +83,4 @@ services:
 volumes:
   px4-ccache:
   ros-log:
+  qgc-config:

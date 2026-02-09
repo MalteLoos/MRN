@@ -1,0 +1,17 @@
+# 1. Start the sim stack
+./launch_sim.sh
+
+# 2. In another terminal — test raw stepping
+cd /workspace/src
+python3 -m px4_gz_gym.test_stepping --n 25 --ticks 10
+
+# 3. Or use as a Gym env
+python3 -m px4_gz_gym.test_gym
+
+# 4. In your own code
+import px4_gz_gym
+env = gymnasium.make("PX4Gz-v0", n_gz_steps=50)  # 50 steps = 0.2 s
+obs, info = env.reset()
+obs, reward, term, trunc, info = env.step(action)
+
+

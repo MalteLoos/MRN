@@ -193,4 +193,18 @@ RUN cat /tmp/.tmux.conf >> /home/dev/.tmux.conf \
 USER dev
 WORKDIR /workspace
 
+# ── 10. Serial device access & extra packages ──────────────
+USER root
+RUN usermod -a -G dialout dev \
+    && apt-get purge -y modemmanager 2>/dev/null || true \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fuse \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── 11. QGroundControl ──────────────────────────────────────
+RUN mkdir -p /opt/qgc \
+    && wget -O /opt/qgc/QGroundControl.AppImage https://d176tv9ibo4jno.cloudfront.net/latest/QGroundControl-x86_64.AppImage \
+    && chmod +x /opt/qgc/QGroundControl.AppImage
+
+USER dev
 CMD ["bash"]

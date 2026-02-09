@@ -45,6 +45,7 @@ alias px4sitl='cd ${PX4_HOME} && make px4_sitl gz_x500'
 alias ddsagent='MicroXRCEAgent udp4 -p 8888'
 alias tb='tensorboard --logdir /workspace/logs --bind_all'
 alias mavros='ros2 launch mavros px4.launch fcu_url:=udp://:14540@127.0.0.1:14557'
+alias qgc='/opt/qgc/QGroundControl.AppImage'
 
 # ── Colcon tab-completion ──────────────────────────────────
 if command -v register-python-argcomplete3 &>/dev/null; then

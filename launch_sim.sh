@@ -114,19 +114,19 @@ MicroXRCEAgent udp4 -p ${DDS_PORT}
 # Gazebo so that all TF stamps, message headers, and timeout
 # logic use simulation time — essential for lockstep.
 # ============================================================
-tmux split-window -t "$SESSION" -v \; \
-    send-keys "\
-${PREAMBLE}
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
-echo '──────────────────────────────────────────────────'
-echo '  🛰  MAVROS 2  (use_sim_time:=true)'
-echo '──────────────────────────────────────────────────'
-echo 'Waiting 5 s for PX4 & DDS to settle …'
-sleep 5
-ros2 launch mavros px4.launch \
-    fcu_url:=${FCU_URL} \
-    use_sim_time:=true
-" Enter
+#tmux split-window -t "$SESSION" -v \; \
+#    send-keys "\
+#${PREAMBLE}
+#export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+#echo '──────────────────────────────────────────────────'
+#echo '  🛰  MAVROS 2  (use_sim_time:=true)'
+#echo '──────────────────────────────────────────────────'
+#echo 'Waiting 5 s for PX4 & DDS to settle …'
+#sleep 5
+#ros2 launch mavros px4.launch \
+#    fcu_url:=${FCU_URL} \
+#    use_sim_time:=true
+#" Enter
 
 # ── Tidy the layout ───────────────────────────────────────
 tmux select-layout -t "$SESSION" even-vertical
