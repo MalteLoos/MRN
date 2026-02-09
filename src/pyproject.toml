@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "px4-gz-gym"
+version = "0.1.0"
+description = "Gymnasium env that deterministically steps Gazebo Harmonic + PX4 in lockstep"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+rl = [
+    "stable-baselines3>=2.0",
+    "sb3-contrib",
+    "tensorboard",
+]
+
+# Register the env so `gymnasium.make("PX4Gz-v0")` works out of the box
+[project.entry-points."gymnasium.envs"]
+__root__ = "px4_gz_gym.registration:register_envs"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
