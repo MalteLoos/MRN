@@ -16,9 +16,11 @@ def register_envs() -> None:
         kwargs={
             "world_name": "default",
             "model_name": "x500_0",
+            "base_model": "x500",
             "n_gz_steps": 25,  # 25 × 0.004 s = 0.1 s per env step
             "step_size": 0.004,
             "action_dim": 4,
+            "takeoff_alt": 2.5,
         },
     )
 
@@ -29,9 +31,11 @@ def register_envs() -> None:
         kwargs={
             "world_name": "default",
             "model_name": "x500_0",
+            "base_model": "x500",
             "n_gz_steps": 50,  # 50 × 0.004 s = 0.2 s per env step
             "step_size": 0.004,
             "action_dim": 4,
+            "takeoff_alt": 2.5,
         },
     )
 

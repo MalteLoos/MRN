@@ -177,8 +177,169 @@ class GzStepController:
         return self.sim_time
 
     def reset_world(self) -> bool:
-        """Send a world-reset request (time-only reset, blocking CLI)."""
-        return self._cli_call("pause: true, reset: {all: true}")
+        """Pause the simulation and reset the cached clock.
+
+        **Does NOT send any ``reset`` flags** to Gazebo because
+        *every* variant (``all``, ``model_only``, ``time_only``)
+        destroys dynamically spawned models in Gazebo Harmonic.
+
+        Instead, callers should use :meth:`remove_model` +
+        :meth:`spawn_model` to respawn the drone cleanly.
+        """
+        ok = self._cli_call("pause: true")
+        with self._clock_lock:
+            self._sim_sec = 0.0
+            self._sim_sec_prev = 0.0
+        return ok
+
+    def remove_model(self, model_name: str) -> bool:
+        """Remove *model_name* from the world.
+
+        Uses ``/world/<world>/remove`` (``gz.msgs.Entity``).
+        Returns True on success, False on timeout / failure.
+        Silently returns True if the model is already gone.
+        """
+        svc = f"/world/{self.world_name}/remove"
+        req_text = f'name: "{model_name}", type: MODEL'
+        try:
+            r = subprocess.run(
+                [
+                    "gz",
+                    "service",
+                    "-s",
+                    svc,
+                    "--reqtype",
+                    "gz.msgs.Entity",
+                    "--reptype",
+                    "gz.msgs.Boolean",
+                    "--timeout",
+                    str(self.timeout_ms),
+                    "--req",
+                    req_text,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_ms / 1000 + 2,
+            )
+            return "data: true" in r.stdout
+        except subprocess.TimeoutExpired:
+            return False
+
+    def spawn_model(
+        self,
+        model_name: str,
+        sdf_path: str,
+        position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        orientation: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+    ) -> bool:
+        """Spawn a model from an SDF file via ``EntityFactory``.
+
+        Mirrors the exact spawn mechanism used by PX4 SITL
+        (``px4-rc.gzsim``).  The SDF is wrapped in an ``<include>``
+        so that Gazebo resolves ``model://`` URIs normally.
+
+        Parameters
+        ----------
+        model_name : str
+            Desired model name (e.g. ``"x500_0"``).
+        sdf_path : str
+            Absolute path to the model's ``model.sdf``.
+        position : tuple
+            ``(x, y, z)`` spawn position in world frame.
+        orientation : tuple
+            ``(w, x, y, z)`` quaternion for spawn orientation.
+        """
+        svc = f"/world/{self.world_name}/create"
+        # Build an SDF wrapper identical to what PX4 uses.
+        # The <pose> element inside <include> sets the initial pose.
+        sdf_str = (
+            '<sdf version="1.6">'
+            "  <include>"
+            f"    <uri>file://{sdf_path}</uri>"
+            f"    <pose>"
+            f"      {position[0]} {position[1]} {position[2]}"
+            f"      0 0 0"
+            f"    </pose>"
+            "  </include>"
+            "</sdf>"
+        )
+        req_text = (
+            f'name: "{model_name}", ' f"allow_renaming: false, " f"sdf: '{sdf_str}'"
+        )
+        try:
+            r = subprocess.run(
+                [
+                    "gz",
+                    "service",
+                    "-s",
+                    svc,
+                    "--reqtype",
+                    "gz.msgs.EntityFactory",
+                    "--reptype",
+                    "gz.msgs.Boolean",
+                    "--timeout",
+                    str(self.timeout_ms),
+                    "--req",
+                    req_text,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_ms / 1000 + 2,
+            )
+            return "data: true" in r.stdout
+        except subprocess.TimeoutExpired:
+            return False
+
+    def set_model_pose(
+        self,
+        model_name: str,
+        position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        orientation: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+    ) -> bool:
+        """Teleport *model_name* to the given pose.
+
+        Uses ``/world/<world>/set_pose`` (``gz.msgs.Pose``).
+        The model must already exist in the world.
+
+        Parameters
+        ----------
+        model_name : str
+            Gazebo model name (e.g. ``"x500_0"``).
+        position : tuple
+            ``(x, y, z)`` in world frame.
+        orientation : tuple
+            ``(w, x, y, z)`` quaternion.
+        """
+        svc = f"/world/{self.world_name}/set_pose"
+        req_text = (
+            f'name: "{model_name}", '
+            f"position: {{x: {position[0]}, y: {position[1]}, z: {position[2]}}}, "
+            f"orientation: {{w: {orientation[0]}, x: {orientation[1]}, "
+            f"y: {orientation[2]}, z: {orientation[3]}}}"
+        )
+        try:
+            r = subprocess.run(
+                [
+                    "gz",
+                    "service",
+                    "-s",
+                    svc,
+                    "--reqtype",
+                    "gz.msgs.Pose",
+                    "--reptype",
+                    "gz.msgs.Boolean",
+                    "--timeout",
+                    str(self.timeout_ms),
+                    "--req",
+                    req_text,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_ms / 1000 + 2,
+            )
+            return "data: true" in r.stdout
+        except subprocess.TimeoutExpired:
+            return False
 
     @property
     def sim_time(self) -> float:

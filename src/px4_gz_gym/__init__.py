@@ -7,5 +7,6 @@
 from px4_gz_gym.env import PX4GazeboEnv  # noqa: F401
 from px4_gz_gym.gz_step import GzStepController  # noqa: F401
 from px4_gz_gym.sensors import GzSensors  # noqa: F401
+from px4_gz_gym import px4_cmd  # noqa: F401
 
-__all__ = ["PX4GazeboEnv", "GzStepController", "GzSensors"]
+__all__ = ["PX4GazeboEnv", "GzStepController", "GzSensors", "px4_cmd"]

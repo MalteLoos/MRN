@@ -35,6 +35,7 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 from px4_gz_gym.gz_step import GzStepController  # noqa: E402
 from px4_gz_gym.sensors import GzSensors  # noqa: E402
+from px4_gz_gym import px4_cmd  # noqa: E402
 
 
 class PX4GazeboEnv(gym.Env):
@@ -61,6 +62,11 @@ class PX4GazeboEnv(gym.Env):
         (roll_rate, pitch_rate, yaw_rate, thrust).
     max_episode_steps : int
         Episode length (in env-steps) before truncation.
+    takeoff_alt : float
+        Target altitude (ENU z, in metres) for the automatic takeoff
+        at the beginning of every episode.  After takeoff the
+        environment switches to OFFBOARD mode so the RL policy can
+        take over.
     render_mode : str | None
         Currently unused (Gazebo provides its own GUI).
     """
@@ -71,10 +77,12 @@ class PX4GazeboEnv(gym.Env):
         self,
         world_name: str = "default",
         model_name: str = "x500_0",
+        base_model: str = "x500",
         n_gz_steps: int = 25,
         step_size: float = 0.004,
         action_dim: int = 4,
         max_episode_steps: int = 1_000,
+        takeoff_alt: float = 2.5,
         render_mode: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -82,10 +90,25 @@ class PX4GazeboEnv(gym.Env):
         # ── config ──────────────────────────────────────────
         self.world_name = world_name
         self.model_name = model_name
+        self.base_model = base_model
         self.n_gz_steps = n_gz_steps
         self.step_size = step_size
         self.max_episode_steps = max_episode_steps
+        self.takeoff_alt = takeoff_alt
         self.render_mode = render_mode
+
+        # Path to the SDF used to (re-)spawn the drone.
+        # Follows the same convention as PX4 SITL.
+        _px4_home = os.environ.get("PX4_HOME", "/opt/PX4-Autopilot")
+        self.model_sdf_path: str = os.path.join(
+            _px4_home,
+            "Tools",
+            "simulation",
+            "gz",
+            "models",
+            base_model,
+            "model.sdf",
+        )
 
         # Sim-time delta per env.step()
         self.dt: float = n_gz_steps * step_size
@@ -133,10 +156,61 @@ class PX4GazeboEnv(gym.Env):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
 
-        # Pause → reset → step once so sensors publish initial data
+        # ── 1. Force-disarm & unpause ───────────────────────
+        #    Cannot remove/respawn the model because PX4's
+        #    GZBridge caches gz-transport subscriptions by
+        #    entity and will never reconnect.  Cannot use any
+        #    WorldControl ``reset`` flag because Gazebo Harmonic
+        #    destroys dynamically spawned models on reset.
+        #
+        #    Instead: disarm in-place → teleport to origin →
+        #    re-arm → takeoff.  PX4 stays connected throughout.
+        px4_cmd.force_disarm()
+        self._gz.unpause()
+
+        # ── 2. Wait for PX4 to confirm disarmed ────────────
+        px4_cmd.wait_for_disarm(timeout=5.0)
+
+        # ── 3. Pause & teleport to spawn pose ──────────────
         self._gz.pause()
-        self._gz.reset_world()
-        self._gz.step_and_wait(1, step_size=self.step_size)
+        self._gz.set_model_pose(
+            self.model_name,
+            position=(0.0, 0.0, 0.0),
+            orientation=(1.0, 0.0, 0.0, 0.0),
+        )
+        # A few physics steps let the pose change propagate
+        # and sensors update with the new position.
+        self._gz.step_and_wait(50, step_size=self.step_size)
+
+        # ── 4. Unpause & wait for PX4 DDS connection ────────
+        px4_cmd.clear_state()
+        self._gz.unpause()
+        px4_cmd.wait_for_connection(timeout=30.0)
+
+        # ── 5. Stream offboard mode + setpoints (PX4 needs
+        #    OffboardControlMode at ≥ 2 Hz for ≥ 2 s before
+        #    it accepts the OFFBOARD mode switch) ────────────
+        px4_cmd.stream_setpoints_and_offboard(
+            n=100,
+            rate_hz=50.0,
+            z_enu=self.takeoff_alt,
+        )
+
+        # ── 6. Switch to OFFBOARD ───────────────────────────
+        #    Must happen *before* arming.  In OFFBOARD mode the
+        #    position controller will fly the drone to the
+        #    commanded altitude once armed (no NAV_TAKEOFF needed).
+        px4_cmd.switch_to_offboard(timeout=10.0)
+
+        # ── 7. Arm & climb to takeoff altitude ──────────────
+        px4_cmd.arm_and_takeoff(
+            target_alt=self.takeoff_alt,
+            timeout=20.0,
+            get_altitude=lambda: float(self._sensors.get_obs()[2]),
+        )
+
+        # ── 8. Pause again for deterministic stepping ──────
+        self._gz.pause()
 
         self._step_count = 0
         obs = self._sensors.get_obs()
@@ -162,6 +236,12 @@ class PX4GazeboEnv(gym.Env):
         #    tested standalone.
         self._apply_action(action)
 
+        # 1b. Offboard heartbeat — keep PX4 in OFFBOARD mode.
+        #     If the subclass _apply_action already publishes
+        #     setpoints this is redundant but harmless.  If no
+        #     subclass is used the heartbeat prevents a failsafe.
+        px4_cmd.publish_offboard_heartbeat(z=self.takeoff_alt)
+
         # 2. Step Gazebo ─────────────────────────────────────
         sim_time = self._gz.step_and_wait(
             n=self.n_gz_steps,
@@ -182,8 +262,16 @@ class PX4GazeboEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def close(self) -> None:
-        """Unpause the world so Gazebo doesn't stay frozen."""
-        self._gz.unpause()
+        """Disarm and unpause the world."""
+        try:
+            self._gz.unpause()
+            # not necessary
+            #px4_cmd.force_disarm()
+            #px4_cmd.wait_for_disarm(timeout=5.0)
+        except Exception:
+            pass
+        finally:
+            self._gz.unpause()
 
     # ════════════════════════════════════════════════════════
     #  Override points  (subclass these)

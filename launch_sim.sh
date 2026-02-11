@@ -71,7 +71,7 @@ info "  /use_sim_time:      true (MAVROS + ROS nodes)"
 echo ""
 
 # ============================================================
-# Pane 0 — PX4 SITL + Gazebo Harmonic  (lockstep)
+# Pane 1 — PX4 SITL + Gazebo Harmonic  (lockstep)
 # ============================================================
 # PX4_SYS_AUTOSTART is resolved by the build system from the
 # model name.  Lockstep is ON by default when the simulator
@@ -84,7 +84,7 @@ ${PREAMBLE}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
 export PX4_SIM_SPEED_FACTOR=${PX4_SIM_SPEED_FACTOR}
 unset PX4_GZ_STANDALONE
-export HEADLESS=${HEADLESS:-1}
+#export HEADLESS=${HEADLESS:-1}
 echo '──────────────────────────────────────────────────'
 echo '  🛩  PX4 SITL  (lockstep + Gazebo Harmonic)'
 echo '──────────────────────────────────────────────────'
@@ -95,7 +95,7 @@ cd ${PX4_HOME} && make px4_sitl ${PX4_MODEL}
 sleep 2
 
 # ============================================================
-# Pane 1 — Micro XRCE-DDS Agent
+# Pane 2 — Micro XRCE-DDS Agent
 # ============================================================
 tmux split-window -t "$SESSION" -v \; \
     send-keys "\
@@ -108,25 +108,34 @@ MicroXRCEAgent udp4 -p ${DDS_PORT}
 " Enter
 
 # ============================================================
-# Pane 2 — MAVROS 2  (with /use_sim_time:=true)
+# Pane 3 — MAVROS 2  (with /use_sim_time:=true)
 # ============================================================
 # use_sim_time makes MAVROS subscribe to /clock published by
 # Gazebo so that all TF stamps, message headers, and timeout
 # logic use simulation time — essential for lockstep.
 # ============================================================
-#tmux split-window -t "$SESSION" -v \; \
-#    send-keys "\
-#${PREAMBLE}
-#export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
-#echo '──────────────────────────────────────────────────'
-#echo '  🛰  MAVROS 2  (use_sim_time:=true)'
-#echo '──────────────────────────────────────────────────'
-#echo 'Waiting 5 s for PX4 & DDS to settle …'
-#sleep 5
-#ros2 launch mavros px4.launch \
-#    fcu_url:=${FCU_URL} \
-#    use_sim_time:=true
-#" Enter
+tmux split-window -t "$SESSION" -v \; \
+    send-keys "\
+${PREAMBLE}
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+echo '──────────────────────────────────────────────────'
+echo '  🛰  MAVROS 2  (use_sim_time:=true)'
+echo '──────────────────────────────────────────────────'
+echo 'Waiting 5 s for PX4 & DDS to settle …'
+sleep 5
+ros2 launch mavros px4.launch \
+    fcu_url:=${FCU_URL} \
+    use_sim_time:=true
+" Enter
+
+# ============================================================
+# Pane 4 — QGC
+# ============================================================
+tmux split-window -t "$SESSION" -v \; \
+    send-keys "\
+${PREAMBLE}
+qgc
+" Enter
 
 # ── Tidy the layout ───────────────────────────────────────
 tmux select-layout -t "$SESSION" even-vertical
@@ -138,5 +147,5 @@ echo ""
 
 # If we're in an interactive terminal, auto-attach
 if [[ -t 0 ]]; then
-    tmux attach -t "$SESSION"
+    : #tmux attach -t "$SESSION"
 fi
