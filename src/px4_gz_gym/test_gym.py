@@ -24,10 +24,7 @@ import px4_gz_gym.registration  # noqa: E402, F401
 
 def main() -> None:
     print("Creating PX4Gz-v0 …")
-    env = gym.make(
-        "PX4Gz-v0",
-        n_gz_steps=25,  # 25 × 4 ms = 100 ms per env.step()
-    )
+    env = gym.make("PX4Gz-v0")
 
     print(f"  observation_space: {env.observation_space}")
     print(f"  action_space:      {env.action_space}")
@@ -38,12 +35,15 @@ def main() -> None:
     print("Resetting …")
     obs, info = env.reset()
     print(f"  sim_time after reset: {info['sim_time']:.4f} s")
-    print(f"  initial obs: {obs}")
+    print(f"  obs keys: {list(obs.keys())}")
+    print(f"  imu:      {obs['imu']}")
+    print(f"  position: {obs['position']}")
+    print(f"  camera:   shape={obs['camera'].shape} dtype={obs['camera'].dtype}")
     print()
 
     # ── rollout ─────────────────────────────────────────────
-    n_steps = 20
-    print(f"Running {n_steps} env-steps with random actions …\n")
+    n_steps = 100
+    print(f"Running {n_steps} env-steps with random actions (50 Hz) …\n")
     print(f"{'step':>4}  {'sim_time':>10}  {'reward':>8}  {'pos_z':>8}  {'done':>5}")
     print("-" * 50)
 
@@ -55,7 +55,7 @@ def main() -> None:
 
         print(
             f"{i:4d}  {info['sim_time']:10.4f}  {reward:+8.3f}  "
-            f"{obs[2]:+8.3f}  {terminated or truncated}"
+            f"{obs['position'][2]:+8.3f}  {terminated or truncated}"
         )
 
         if terminated or truncated:

@@ -9,32 +9,33 @@ import gymnasium as gym
 
 
 def register_envs() -> None:
+    # 50 Hz control  (5 × 0.004 s = 0.02 s per env step)
+    # x500_mono_cam with roll/pitch/thrust actions
     gym.register(
         id="PX4Gz-v0",
         entry_point="px4_gz_gym.env:PX4GazeboEnv",
-        max_episode_steps=1_000,
+        max_episode_steps=2_000,
         kwargs={
             "world_name": "default",
-            "model_name": "x500_0",
-            "base_model": "x500",
-            "n_gz_steps": 25,  # 25 × 0.004 s = 0.1 s per env step
+            "model_name": "x500_mono_cam_0",
+            "base_model": "x500_mono_cam",
+            "n_gz_steps": 5,   # 5 × 0.004 s = 0.02 s → 50 Hz
             "step_size": 0.004,
-            "action_dim": 4,
             "takeoff_alt": 2.5,
         },
     )
 
+    # 10 Hz control variant  (25 × 0.004 s = 0.1 s per env step)
     gym.register(
-        id="PX4Gz-Fast-v0",
+        id="PX4Gz-10Hz-v0",
         entry_point="px4_gz_gym.env:PX4GazeboEnv",
-        max_episode_steps=500,
+        max_episode_steps=1_000,
         kwargs={
             "world_name": "default",
-            "model_name": "x500_0",
-            "base_model": "x500",
-            "n_gz_steps": 50,  # 50 × 0.004 s = 0.2 s per env step
+            "model_name": "x500_mono_cam_0",
+            "base_model": "x500_mono_cam",
+            "n_gz_steps": 25,  # 25 × 0.004 s = 0.1 s → 10 Hz
             "step_size": 0.004,
-            "action_dim": 4,
             "takeoff_alt": 2.5,
         },
     )

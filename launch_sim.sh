@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ── Configurable parameters ────────────────────────────────
-PX4_MODEL="${1:-gz_x500}"                       # PX4 SITL airframe
+PX4_MODEL="${1:-gz_x500_mono_cam}"               # PX4 SITL airframe
 ROS_DOMAIN_ID="${2:-0}"                         # ROS 2 domain isolation
 PX4_HOME="${PX4_HOME:-/opt/PX4-Autopilot}"      # PX4 source tree
 SESSION="px4sim"                                # tmux session name
@@ -29,7 +29,7 @@ FCU_URL="udp://:14540@127.0.0.1:14557"         # MAVROS ↔ PX4 link
 #  PX4_SIM_SPEED_FACTOR=1 is real-time; >1 faster, <1 slower.
 #  Lockstep is the PX4 default with Gazebo; we export the var
 #  explicitly for clarity and to guard against overrides.
-PX4_SIM_SPEED_FACTOR="${PX4_SIM_SPEED_FACTOR:-1}"
+PX4_SIM_SPEED_FACTOR=$"${PX4_SIM_SPEED_FACTOR:-2}"
 
 # ── Preamble sourced inside every tmux pane ───────────────
 read -r -d '' PREAMBLE <<'SHELL' || true
@@ -84,7 +84,7 @@ ${PREAMBLE}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
 export PX4_SIM_SPEED_FACTOR=${PX4_SIM_SPEED_FACTOR}
 unset PX4_GZ_STANDALONE
-#export HEADLESS=${HEADLESS:-1}
+export HEADLESS=${HEADLESS:-1}
 echo '──────────────────────────────────────────────────'
 echo '  🛩  PX4 SITL  (lockstep + Gazebo Harmonic)'
 echo '──────────────────────────────────────────────────'
@@ -108,7 +108,24 @@ MicroXRCEAgent udp4 -p ${DDS_PORT}
 " Enter
 
 # ============================================================
-# Pane 3 — MAVROS 2  (with /use_sim_time:=true)
+# Pane 3 — ros_gz_bridge  (Gazebo /clock → ROS 2 /clock)
+# ============================================================
+# Gazebo publishes clock only on gz-transport; ROS 2 nodes
+# using use_sim_time need a /clock topic on the ROS 2 graph.
+# This bridge forwards the Gazebo world clock to ROS 2.
+# ============================================================
+tmux split-window -t "$SESSION" -v \; \
+    send-keys "\
+${PREAMBLE}
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+echo '──────────────────────────────────────────────────'
+echo '  ⏱  ros_gz_bridge  (Gazebo clock → ROS 2 /clock)'
+echo '──────────────────────────────────────────────────'
+ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock
+" Enter
+
+# ============================================================
+# Pane 4 — MAVROS 2  (with /use_sim_time:=true)
 # ============================================================
 # use_sim_time makes MAVROS subscribe to /clock published by
 # Gazebo so that all TF stamps, message headers, and timeout
@@ -129,16 +146,33 @@ ros2 launch mavros px4.launch \
 " Enter
 
 # ============================================================
-# Pane 4 — QGC
+# Window 2 — visualisation tools (two panes)
+#   Pane 1: RViz2  (use_sim_time + sim.rviz)
+#   Pane 2: QGC
 # ============================================================
-tmux split-window -t "$SESSION" -v \; \
+tmux new-window -t "$SESSION" -n viz
+
+# Pane 1 — RViz2
+tmux send-keys -t "$SESSION":viz.1 "\
+${PREAMBLE}
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+echo '──────────────────────────────────────────────────'
+echo '  🧭  RViz2  (use_sim_time:=true, sim.rviz)'
+echo '──────────────────────────────────────────────────'
+rviz2 -d /workspace/src/configs/sim.rviz --ros-args -p use_sim_time:=true
+" Enter
+
+# Pane 1 — QGC
+tmux split-window -t "$SESSION":viz -v \; \
     send-keys "\
 ${PREAMBLE}
 qgc
 " Enter
 
+tmux select-layout -t "$SESSION":viz even-vertical
+
 # ── Tidy the layout ───────────────────────────────────────
-tmux select-layout -t "$SESSION" even-vertical
+tmux select-layout -t "$SESSION":sim even-vertical
 
 info "tmux session '${SESSION}' is running."
 info "Attach with:  tmux attach -t ${SESSION}"

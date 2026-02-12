@@ -1,17 +1,26 @@
-# 1. Start the sim stack
+# 1. Start the sim stack (now uses x500_mono_cam by default)
 ./launch_sim.sh
 
 # 2. In another terminal — test raw stepping
 cd /workspace/src
-python3 -m px4_gz_gym.test_stepping --n 25 --ticks 10
+python3 -m px4_gz_gym.test_stepping --n 5 --ticks 20
 
-# 3. Or use as a Gym env
+# 3. Or use as a Gym env (50 Hz, roll/pitch/thrust, IMU+camera obs)
 python3 -m px4_gz_gym.test_gym
 
 # 4. In your own code
 import px4_gz_gym
-env = gymnasium.make("PX4Gz-v0", n_gz_steps=50)  # 50 steps = 0.2 s
+env = gymnasium.make("PX4Gz-v0")  # 50 Hz attitude control
 obs, info = env.reset()
+# obs = {"imu": (6,), "camera": (64,64,3), "position": (3,),
+#         "velocity": (3,), "orientation": (4,)}
+action = env.action_space.sample()  # [roll, pitch, thrust] in [-1, 1]
 obs, reward, term, trunc, info = env.step(action)
+
+# RViz topics (auto-published):
+#   /drone/camera/image   — full-res camera for RViz
+#   /drone/imu            — 50 Hz averaged IMU
+#   /drone/pose           — drone pose
+#   /drone/trajectory     — past flight path
 
 
