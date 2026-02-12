@@ -42,7 +42,7 @@ def main() -> None:
     print()
 
     # ── rollout ─────────────────────────────────────────────
-    n_steps = 100
+    n_steps = 1000
     print(f"Running {n_steps} env-steps with random actions (50 Hz) …\n")
     print(f"{'step':>4}  {'sim_time':>10}  {'reward':>8}  {'pos_z':>8}  {'done':>5}")
     print("-" * 50)

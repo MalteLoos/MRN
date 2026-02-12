@@ -29,7 +29,7 @@ FCU_URL="udp://:14540@127.0.0.1:14557"         # MAVROS ↔ PX4 link
 #  PX4_SIM_SPEED_FACTOR=1 is real-time; >1 faster, <1 slower.
 #  Lockstep is the PX4 default with Gazebo; we export the var
 #  explicitly for clarity and to guard against overrides.
-PX4_SIM_SPEED_FACTOR=$"${PX4_SIM_SPEED_FACTOR:-2}"
+PX4_SIM_SPEED_FACTOR="${PX4_SIM_SPEED_FACTOR:-5}"
 
 # ── Preamble sourced inside every tmux pane ───────────────
 read -r -d '' PREAMBLE <<'SHELL' || true
