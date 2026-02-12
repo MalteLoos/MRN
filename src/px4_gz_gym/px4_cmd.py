@@ -22,6 +22,7 @@ callback).
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Optional
@@ -40,6 +41,7 @@ from rclpy.qos import (
 from px4_msgs.msg import (
     OffboardControlMode,
     TrajectorySetpoint,
+    VehicleAttitudeSetpoint,
     VehicleCommand,
     VehicleStatus,
 )
@@ -82,7 +84,16 @@ class _PX4Cmd(Node):
     """Thin ROS 2 helper for commanding PX4 via the DDS agent."""
 
     def __init__(self) -> None:
-        super().__init__("px4_gz_gym_cmd")
+        super().__init__(
+            "px4_gz_gym_cmd",
+            parameter_overrides=[
+                rclpy.Parameter(
+                    "use_sim_time",
+                    rclpy.Parameter.Type.BOOL,
+                    True,
+                ),
+            ],
+        )
 
         # ── vehicle status subscription ─────────────────────
         self._status_lock = threading.Lock()
@@ -107,6 +118,13 @@ class _PX4Cmd(Node):
         self._setpoint_pub = self.create_publisher(
             TrajectorySetpoint,
             "/fmu/in/trajectory_setpoint",
+            10,
+        )
+
+        # Attitude setpoint  (roll / pitch / thrust)
+        self._attitude_pub = self.create_publisher(
+            VehicleAttitudeSetpoint,
+            "/fmu/in/vehicle_attitude_setpoint",
             10,
         )
 
@@ -198,6 +216,46 @@ class _PX4Cmd(Node):
         msg.yaw = float("nan")  # hold current heading
         msg.yawspeed = float("nan")
         self._setpoint_pub.publish(msg)
+
+    def publish_attitude_setpoint(
+        self,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        thrust: float = 0.5,
+    ) -> None:
+        """Publish a ``VehicleAttitudeSetpoint``.
+
+        Parameters
+        ----------
+        roll, pitch, yaw : float
+            Desired Euler angles in **radians** (NED body frame).
+        thrust : float
+            Normalised collective thrust in ``[0, 1]``.  Mapped to
+            ``thrust_body[2] = -thrust`` (NED: body-Z points down).
+        """
+        msg = VehicleAttitudeSetpoint()
+        msg.timestamp = self._px4_timestamp()
+
+        # Euler → quaternion  (ZYX intrinsic = aerospace convention)
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+
+        msg.q_d[0] = cr * cp * cy + sr * sp * sy  # w
+        msg.q_d[1] = sr * cp * cy - cr * sp * sy  # x
+        msg.q_d[2] = cr * sp * cy + sr * cp * sy  # y
+        msg.q_d[3] = cr * cp * sy - sr * sp * cy  # z
+
+        # Multicopter thrust: body-Z is "down" in NED, so negative = up
+        msg.thrust_body[0] = 0.0
+        msg.thrust_body[1] = 0.0
+        msg.thrust_body[2] = -float(thrust)
+
+        self._attitude_pub.publish(msg)
 
     def send_vehicle_command(
         self,
@@ -488,6 +546,49 @@ def wait_for_disarm(timeout: float = 5.0) -> bool:
         node.disarm(force=True)
         time.sleep(0.2)
     return not node.armed
+
+
+def publish_attitude_command(
+    roll: float = 0.0,
+    pitch: float = 0.0,
+    yaw: float = 0.0,
+    thrust: float = 0.5,
+) -> None:
+    """Publish an attitude setpoint to PX4.
+
+    Also publishes an ``OffboardControlMode`` heartbeat with
+    ``attitude=True`` so PX4 stays in OFFBOARD attitude mode.
+
+    Parameters
+    ----------
+    roll, pitch, yaw : float
+        Desired Euler angles in radians (NED).
+    thrust : float
+        Normalised collective thrust ``[0, 1]``.
+    """
+    node = _ensure_node()
+    node.publish_offboard_control_mode(attitude=True, position=False)
+    node.publish_attitude_setpoint(roll, pitch, yaw, thrust)
+
+
+def publish_offboard_attitude_heartbeat(
+    thrust: float = 0.5,
+) -> None:
+    """Keep PX4 in OFFBOARD **attitude** mode.
+
+    Publishes ``OffboardControlMode(attitude=True)`` plus a
+    neutral attitude setpoint (hover) as a safety fallback.
+    The RL policy's own ``publish_attitude_command`` will override
+    this within the same sim step.
+    """
+    node = _ensure_node()
+    node.publish_offboard_control_mode(attitude=True, position=False)
+    node.publish_attitude_setpoint(
+        roll=0.0,
+        pitch=0.0,
+        yaw=0.0,
+        thrust=thrust,
+    )
 
 
 def land_and_disarm(timeout: float = 15.0) -> bool:

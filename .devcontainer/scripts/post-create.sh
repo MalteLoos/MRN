@@ -46,7 +46,18 @@ if command -v xhost &>/dev/null; then
     xhost +local:docker 2>/dev/null || true
 fi
 
-# ── 6. Quick sanity checks ────────────────────────────────
+# ── 6. Apply persistent Gazebo model patches ──────────────
+#    SDF files under /opt/PX4-Autopilot are baked into the
+#    Docker image and lost on rebuild.  We keep our modified
+#    versions in the bind-mounted workspace and copy them in.
+PATCH_DIR="/workspace/.devcontainer/patches"
+if [[ -f "${PATCH_DIR}/mono_cam_model.sdf" ]]; then
+    sudo cp "${PATCH_DIR}/mono_cam_model.sdf" \
+        /opt/PX4-Autopilot/Tools/simulation/gz/models/mono_cam/model.sdf
+    echo "📎  Patched mono_cam model.sdf (256×256 @ 20 Hz)"
+fi
+
+# ── 7. Quick sanity checks ────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────"
 echo "  Environment sanity checks"
