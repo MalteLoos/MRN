@@ -64,6 +64,7 @@ SENSOR_QOS = QoSProfile(
 # ROS 2 Node
 # ---------------------------------------------------------------------------
 
+
 class DroneBodyRateNode(Node):
     """
     ROS 2 node that fuses IMU + camera + pose, runs the RL policy, and
@@ -82,8 +83,7 @@ class DroneBodyRateNode(Node):
         self.declare_parameter("device", "cpu")
 
         # Waypoints as flat list [x1,y1,z1, x2,y2,z2, ...]
-        self.declare_parameter("route", [0.0, 0.0, 5.0,
-                                          10.0, 0.0, 5.0])
+        self.declare_parameter("route", [0.0, 0.0, 5.0, 10.0, 0.0, 5.0])
 
         safety_radius = self.get_parameter("safety_radius").value
         device = self.get_parameter("device").value
@@ -108,21 +108,34 @@ class DroneBodyRateNode(Node):
 
         # ---- subscribers ----------------------------------------------------
         self._sub_imu = self.create_subscription(
-            Imu, "/drone/imu", self._imu_cb, SENSOR_QOS,
+            Imu,
+            "/drone/imu",
+            self._imu_cb,
+            SENSOR_QOS,
         )
         self._sub_cam = self.create_subscription(
-            Image, "/drone/camera/image", self._cam_cb, SENSOR_QOS,
+            Image,
+            "/drone/camera/image",
+            self._cam_cb,
+            SENSOR_QOS,
         )
         self._sub_pose = self.create_subscription(
-            PoseStamped, "/drone/pose", self._pose_cb, SENSOR_QOS,
+            PoseStamped,
+            "/drone/pose",
+            self._pose_cb,
+            SENSOR_QOS,
         )
 
         # ---- publishers -----------------------------------------------------
         self._pub_cmd = self.create_publisher(
-            TwistStamped, "/drone/cmd_bodyrate", 10,
+            TwistStamped,
+            "/drone/cmd_bodyrate",
+            10,
         )
         self._pub_wp = self.create_publisher(
-            PoseArray, "/drone/waypoints", 10,
+            PoseArray,
+            "/drone/waypoints",
+            10,
         )
 
         # ---- control timer --------------------------------------------------
@@ -144,27 +157,27 @@ class DroneBodyRateNode(Node):
         flat: List[float],
     ) -> List[Tuple[float, float, float]]:
         """Convert [x1,y1,z1, x2,y2,z2, ...] → [(x1,y1,z1), ...]."""
-        assert len(flat) % 3 == 0 and len(flat) >= 6, (
-            "Route must have ≥ 2 waypoints (6 floats)."
-        )
-        return [
-            (flat[i], flat[i + 1], flat[i + 2])
-            for i in range(0, len(flat), 3)
-        ]
+        assert (
+            len(flat) % 3 == 0 and len(flat) >= 6
+        ), "Route must have ≥ 2 waypoints (6 floats)."
+        return [(flat[i], flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)]
 
     # ------------------------------------------------------------------
     # Subscriber callbacks
     # ------------------------------------------------------------------
 
     def _imu_cb(self, msg: Imu) -> None:
-        self._latest_imu = np.array([
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-            msg.angular_velocity.x,
-            msg.angular_velocity.y,
-            msg.angular_velocity.z,
-        ], dtype=np.float32)
+        self._latest_imu = np.array(
+            [
+                msg.linear_acceleration.x,
+                msg.linear_acceleration.y,
+                msg.linear_acceleration.z,
+                msg.angular_velocity.x,
+                msg.angular_velocity.y,
+                msg.angular_velocity.z,
+            ],
+            dtype=np.float32,
+        )
 
     def _cam_cb(self, msg: Image) -> None:
         # Supports rgb8 and bgr8 encodings; fall back to raw bytes
@@ -172,8 +185,8 @@ class DroneBodyRateNode(Node):
         channels = 3
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, channels)
         if msg.encoding == "bgr8":
-            img = img[:, :, ::-1].copy()        # BGR → RGB
-        self._latest_cam = img                   # kept as uint8, agent normalises
+            img = img[:, :, ::-1].copy()  # BGR → RGB
+        self._latest_cam = img  # kept as uint8, agent normalises
 
     def _pose_cb(self, msg: PoseStamped) -> None:
         p = msg.pose.position
@@ -186,8 +199,8 @@ class DroneBodyRateNode(Node):
     def _sim_header(self, frame_id: str = "base_link") -> Header:
         """Build a Header stamped with the current simulation clock."""
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()   # sim time when
-        header.frame_id = frame_id                       # use_sim_time=true
+        header.stamp = self.get_clock().now().to_msg()  # sim time when
+        header.frame_id = frame_id  # use_sim_time=true
         return header
 
     # ------------------------------------------------------------------
@@ -196,9 +209,11 @@ class DroneBodyRateNode(Node):
 
     def _control_loop(self) -> None:
         # Wait until all sensor streams have been received at least once
-        if (self._latest_imu is None
-                or self._latest_cam is None
-                or self._latest_pos is None):
+        if (
+            self._latest_imu is None
+            or self._latest_cam is None
+            or self._latest_pos is None
+        ):
             return
 
         # ---- run policy -----------------------------------------------------
@@ -213,10 +228,10 @@ class DroneBodyRateNode(Node):
         # ---- publish body-rate command --------------------------------------
         cmd = TwistStamped()
         cmd.header = self._sim_header("base_link")
-        cmd.twist.angular.x = float(action[0])   # roll  rate
-        cmd.twist.angular.y = float(action[1])   # pitch rate
-        cmd.twist.angular.z = float(action[2])   # yaw   rate
-        cmd.twist.linear.z  = float(action[3])   # thrust
+        cmd.twist.angular.x = float(action[0])  # roll  rate
+        cmd.twist.angular.y = float(action[1])  # pitch rate
+        cmd.twist.angular.z = float(action[2])  # yaw   rate
+        cmd.twist.linear.z = float(action[3])  # thrust
         self._pub_cmd.publish(cmd)
 
         # ---- publish active waypoints for visualisation ---------------------
@@ -265,6 +280,7 @@ class DroneBodyRateNode(Node):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)

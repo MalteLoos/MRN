@@ -14,64 +14,77 @@ anticipatory trajectories.
 
 from __future__ import annotations
 
+import os
+
+# Fix protobuf compatibility issue with Gazebo before any gz imports
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+
+from px4_gz_gym.env import PX4GazeboEnv
+from px4_gz_gym import px4_cmd
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ModelConfig:
     """All tuneable hyper-parameters live here."""
 
     # --- Camera input ---------------------------------------------------------
-    cam_channels: int = 3           # RGB
+    cam_channels: int = 3  # RGB
     cam_height: int = 64
     cam_width: int = 64
-    cam_feature_dim: int = 128      # CNN output size
+    cam_feature_dim: int = 128  # CNN output size
 
     # --- IMU input ------------------------------------------------------------
-    imu_dim: int = 6                # 3 accel + 3 gyro
+    imu_dim: int = 6  # 3 accel + 3 gyro
 
     # --- Waypoint input -------------------------------------------------------
-    waypoint_dim: int = 3           # (x, y, z) per waypoint — in body frame
-    num_waypoints: int = 2          # always 2 look-ahead waypoints
+    waypoint_dim: int = 3  # (x, y, z) per waypoint — in body frame
+    num_waypoints: int = 2  # always 2 look-ahead waypoints
 
     # --- Fusion / shared backbone ---------------------------------------------
     fusion_hidden: int = 256
     fusion_layers: int = 2
 
     # --- Actor (policy) -------------------------------------------------------
-    action_dim: int = 4             # roll_rate, pitch_rate, yaw_rate, thrust
+    action_dim: int = 4  # roll_rate, pitch_rate, yaw_rate, thrust
     log_std_min: float = -5.0
     log_std_max: float = 0.5
 
     # --- Waypoint management --------------------------------------------------
-    safety_radius: float = 1.0     # metres — when within this, waypoint reached
+    safety_radius: float = 1.0  # metres — when within this, waypoint reached
 
     # --- Training defaults ----------------------------------------------------
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     lr: float = 3e-4
-    entropy_coef: float = 0.01
+    lr_end: float = 1e-5
+    entropy_coef: float = 0.05
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+    target_kl: float = 0.02
 
 
 # ---------------------------------------------------------------------------
 # Camera encoder (lightweight CNN)
 # ---------------------------------------------------------------------------
+
 
 class CameraEncoder(nn.Module):
     """Encodes an RGB image into a compact feature vector."""
@@ -109,6 +122,7 @@ class CameraEncoder(nn.Module):
 # State encoder  (IMU + waypoints)
 # ---------------------------------------------------------------------------
 
+
 class StateEncoder(nn.Module):
     """Encodes IMU readings and the two upcoming waypoints."""
 
@@ -144,19 +158,21 @@ class StateEncoder(nn.Module):
 # Multi-modal fusion backbone
 # ---------------------------------------------------------------------------
 
+
 class FusionBackbone(nn.Module):
     """Merges camera features and state features into a shared representation."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         cam_feat = cfg.cam_feature_dim  # 128
-        state_feat = 64                 # from StateEncoder
+        state_feat = 64  # from StateEncoder
         in_dim = cam_feat + state_feat
 
         layers: list[nn.Module] = []
         for i in range(cfg.fusion_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else cfg.fusion_hidden,
-                                    cfg.fusion_hidden))
+            layers.append(
+                nn.Linear(in_dim if i == 0 else cfg.fusion_hidden, cfg.fusion_hidden)
+            )
             layers.append(nn.ReLU(inplace=True))
         self.net = nn.Sequential(*layers)
         self.output_dim = cfg.fusion_hidden
@@ -180,6 +196,7 @@ class FusionBackbone(nn.Module):
 # Actor head  — outputs body-rate commands
 # ---------------------------------------------------------------------------
 
+
 class ActorHead(nn.Module):
     """
     Gaussian policy head.
@@ -192,10 +209,10 @@ class ActorHead(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.mu = nn.Sequential(
-            nn.Linear(cfg.fusion_hidden, 64),
+            nn.Linear(cfg.fusion_hidden, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, cfg.action_dim),
-            nn.Tanh(),                           # bound means to [-1, 1]
+            nn.Linear(128, cfg.action_dim),
+            nn.Tanh(),  # bound means to [-1, 1]
         )
         # Learnable log-std (state-independent)
         self.log_std = nn.Parameter(torch.zeros(cfg.action_dim))
@@ -210,8 +227,9 @@ class ActorHead(nn.Module):
             log_std: (B, action_dim) — clamped
         """
         mu = self.mu(fused)
-        log_std = self.log_std.clamp(self.cfg.log_std_min,
-                                     self.cfg.log_std_max).expand_as(mu)
+        log_std = self.log_std.clamp(
+            self.cfg.log_std_min, self.cfg.log_std_max
+        ).expand_as(mu)
         return mu, log_std
 
     def sample(
@@ -245,13 +263,14 @@ class ActorHead(nn.Module):
 # Critic head  — estimates state value V(s)
 # ---------------------------------------------------------------------------
 
+
 class CriticHead(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.fusion_hidden, 64),
+            nn.Linear(cfg.fusion_hidden, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
+            nn.Linear(128, 1),
         )
 
     def forward(self, fused: torch.Tensor) -> torch.Tensor:
@@ -262,6 +281,7 @@ class CriticHead(nn.Module):
 # ---------------------------------------------------------------------------
 # Full actor-critic policy
 # ---------------------------------------------------------------------------
+
 
 class DronePolicy(nn.Module):
     """
@@ -337,6 +357,7 @@ class DronePolicy(nn.Module):
 # Waypoint buffer manager
 # ---------------------------------------------------------------------------
 
+
 class WaypointBuffer:
     """
     Manages the two-waypoint look-ahead buffer per drone.
@@ -360,6 +381,7 @@ class WaypointBuffer:
     ):
         assert len(route) >= 2, "Route must contain at least 2 waypoints."
         self.safety_radius = safety_radius
+        self._original_route = route  # store original for resets
         self._queue: deque[Tuple[float, float, float]] = deque(route)
 
         # Initialise the two-slot buffer
@@ -369,11 +391,18 @@ class WaypointBuffer:
         self.reached_count: int = 0
         self.finished: bool = False
 
+    def reset_to_start(self) -> None:
+        """Reset buffer to initial state without recreating object (fast path)."""
+        self._queue = deque(self._original_route)
+        self.wp0 = self._queue.popleft()
+        self.wp1 = self._queue.popleft()
+        self.reached_count = 0
+        self.finished = False
+
     # ----- internal -------------------------------------------------------
 
     @staticmethod
-    def _dist(a: Tuple[float, float, float],
-              b: Tuple[float, float, float]) -> float:
+    def _dist(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
         return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b)))
 
     def _advance(self) -> None:
@@ -431,6 +460,7 @@ class WaypointBuffer:
 # ---------------------------------------------------------------------------
 # High-level agent wrapper  (optional convenience)
 # ---------------------------------------------------------------------------
+
 
 class DroneAgent:
     """
@@ -491,9 +521,9 @@ class DroneAgent:
         if not isinstance(cam, torch.Tensor):
             cam = torch.as_tensor(cam, dtype=torch.float32)
         if cam.ndim == 3 and cam.shape[-1] in (1, 3):
-            cam = cam.permute(2, 0, 1)         # HWC → CHW
+            cam = cam.permute(2, 0, 1)  # HWC → CHW
         if cam.ndim == 3:
-            cam = cam.unsqueeze(0)              # add batch dim
+            cam = cam.unsqueeze(0)  # add batch dim
         if cam.max() > 1.0:
             cam = cam / 255.0
         cam = cam.to(self.device)
@@ -507,15 +537,22 @@ class DroneAgent:
         imu = imu.to(self.device)
 
         # --- update waypoint buffer & build tensor ---------------------------
-        drone_pos = tuple(float(x) for x in obs["drone_pos"][:3])
+        pos = obs["drone_pos"]
+        drone_pos: Tuple[float, float, float] = (
+            float(pos[0]),
+            float(pos[1]),
+            float(pos[2]),
+        )
         wp_tensor = self._buffer.current_targets_tensor(
-            drone_pos, device=self.device,
+            drone_pos,
+            device=self.device,
         )
 
         # --- forward pass ----------------------------------------------------
         policy_obs = {"cam": cam, "imu": imu, "waypoints": wp_tensor}
         action, log_prob, value = self.policy.act(
-            policy_obs, deterministic=deterministic,
+            policy_obs,
+            deterministic=deterministic,
         )
         return action.squeeze(0).cpu()
 
@@ -546,6 +583,7 @@ class DroneAgent:
 # ---------------------------------------------------------------------------
 # Rollout buffer  (PPO experience storage + GAE)
 # ---------------------------------------------------------------------------
+
 
 class RolloutBuffer:
     """
@@ -603,18 +641,18 @@ class RolloutBuffer:
         self.gae_lambda = gae_lambda
 
         # ----- pre-allocate storage ------------------------------------------
-        self.cam       = torch.zeros(buffer_size, *cam_shape, device=self.device)
-        self.imu       = torch.zeros(buffer_size, imu_dim,    device=self.device)
-        self.waypoints = torch.zeros(buffer_size, wp_dim,     device=self.device)
-        self.actions   = torch.zeros(buffer_size, action_dim, device=self.device)
-        self.log_probs = torch.zeros(buffer_size,             device=self.device)
-        self.rewards   = torch.zeros(buffer_size,             device=self.device)
-        self.values    = torch.zeros(buffer_size,             device=self.device)
-        self.dones     = torch.zeros(buffer_size,             device=self.device)
+        self.cam = torch.zeros(buffer_size, *cam_shape, device=self.device)
+        self.imu = torch.zeros(buffer_size, imu_dim, device=self.device)
+        self.waypoints = torch.zeros(buffer_size, wp_dim, device=self.device)
+        self.actions = torch.zeros(buffer_size, action_dim, device=self.device)
+        self.log_probs = torch.zeros(buffer_size, device=self.device)
+        self.rewards = torch.zeros(buffer_size, device=self.device)
+        self.values = torch.zeros(buffer_size, device=self.device)
+        self.dones = torch.zeros(buffer_size, device=self.device)
 
         # ----- computed after finish() ---------------------------------------
         self.advantages = torch.zeros(buffer_size, device=self.device)
-        self.returns    = torch.zeros(buffer_size, device=self.device)
+        self.returns = torch.zeros(buffer_size, device=self.device)
 
         self.ptr = 0
         self.full = False
@@ -646,14 +684,14 @@ class RolloutBuffer:
         assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
 
         i = self.ptr
-        self.cam[i]       = cam
-        self.imu[i]       = imu
+        self.cam[i] = cam
+        self.imu[i] = imu
         self.waypoints[i] = waypoints
-        self.actions[i]   = action
+        self.actions[i] = action
         self.log_probs[i] = log_prob
-        self.rewards[i]   = reward
-        self.values[i]    = value.squeeze()
-        self.dones[i]     = float(done)
+        self.rewards[i] = reward
+        self.values[i] = value.squeeze()
+        self.dones[i] = float(done)
         self.ptr += 1
 
         if self.ptr == self.buffer_size:
@@ -685,10 +723,14 @@ class RolloutBuffer:
                 next_non_terminal = 1.0 - self.dones[t].item()
                 next_value = self.values[t + 1].item()
 
-            delta = (self.rewards[t].item()
-                     + self.gamma * next_value * next_non_terminal
-                     - self.values[t].item())
-            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            delta = (
+                self.rewards[t].item()
+                + self.gamma * next_value * next_non_terminal
+                - self.values[t].item()
+            )
+            last_gae = (
+                delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            )
             self.advantages[t] = last_gae
 
         self.returns[:n] = self.advantages[:n] + self.values[:n]
@@ -718,20 +760,21 @@ class RolloutBuffer:
 
             yield {
                 "obs": {
-                    "cam":       self.cam[idx],
-                    "imu":       self.imu[idx],
+                    "cam": self.cam[idx],
+                    "imu": self.imu[idx],
                     "waypoints": self.waypoints[idx],
                 },
-                "actions":       self.actions[idx],
+                "actions": self.actions[idx],
                 "old_log_probs": self.log_probs[idx],
-                "advantages":    self.advantages[idx],
-                "returns":       self.returns[idx],
+                "advantages": self.advantages[idx],
+                "returns": self.returns[idx],
             }
 
 
 # ---------------------------------------------------------------------------
 # PPO Trainer
 # ---------------------------------------------------------------------------
+
 
 class PPOTrainer:
     """
@@ -756,7 +799,8 @@ class PPOTrainer:
         cfg: ModelConfig | None = None,
         rollout_steps: int = 2048,
         batch_size: int = 64,
-        ppo_epochs: int = 10,
+        ppo_epochs: int = 4,
+        num_epochs: int = 100,
     ):
         self.agent = agent
         self.cfg = cfg or agent.cfg
@@ -780,12 +824,23 @@ class PPOTrainer:
         )
 
         self.optimiser = torch.optim.Adam(
-            agent.policy.parameters(), lr=self.cfg.lr,
+            agent.policy.parameters(),
+            lr=self.cfg.lr,
         )
+
+        # Learning rate scheduler: linear decay from lr to lr_end
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimiser,
+            start_factor=1.0,
+            end_factor=self.cfg.lr_end / self.cfg.lr,
+            total_iters=num_epochs,
+        )
+
+        self._prev_wp_dist: Optional[float] = None
 
     # ----- rollout collection ---------------------------------------------
 
-    def collect_rollout(self, env) -> dict:
+    def collect_rollout(self, env, route: List[Tuple[float, float, float]]) -> dict:
         """
         Run the current policy in ``env`` for ``rollout_steps`` transitions
         and fill the rollout buffer.
@@ -801,11 +856,13 @@ class PPOTrainer:
             info dict with ``total_reward`` and ``episodes_completed``.
         """
         self.buffer.reset()
-        obs = env.reset()
+        self._prev_wp_dist = None
+        self.agent.set_route(route)
+        obs, _ = env.reset()
         total_reward = 0.0
         episodes = 0
 
-        for _ in range(self.rollout_steps):
+        for step_idx in range(self.rollout_steps):
             # --- prepare tensors (single-step, no batch) ---------------------
             cam, imu, wp_tensor = self._obs_to_tensors(obs)
 
@@ -819,7 +876,11 @@ class PPOTrainer:
 
             # --- environment step --------------------------------------------
             action_np = action_sq.cpu()
-            next_obs, reward, done, info = env.step(action_np)
+            next_obs, env_reward, terminated, truncated, info = env.step(action_np)
+            done = terminated or truncated
+
+            # Waypoint-shaped reward overrides env reward (hover-only default)
+            reward = self._compute_wp_reward(obs, wp_tensor)
 
             # --- store -------------------------------------------------------
             self.buffer.store(
@@ -835,10 +896,17 @@ class PPOTrainer:
             total_reward += float(reward)
 
             if done:
-                obs = env.reset()
+                obs, _ = env.reset()
                 episodes += 1
+                self._prev_wp_dist = None
+                self.agent._buffer.reset_to_start()
             else:
                 obs = next_obs
+
+            # --- Print progress every 20% of rollout ---
+            if (step_idx + 1) % (self.rollout_steps // 5) == 0:
+                pct = ((step_idx + 1) / self.rollout_steps) * 100
+                print(f"  {pct:3.0f}% | ", end="", flush=True)
 
         # --- bootstrap last value --------------------------------------------
         cam, imu, wp_tensor = self._obs_to_tensors(obs)
@@ -852,6 +920,43 @@ class PPOTrainer:
         self.buffer.finish(last_value)
 
         return {"total_reward": total_reward, "episodes_completed": episodes}
+
+    def _compute_wp_reward(self, obs: dict, wp_tensor: torch.Tensor) -> float:
+        """
+        Dense shaping toward the current waypoint.
+
+        Reward components:
+        - Normalised distance penalty
+        - Progress reward (clipped)
+        - Reach bonus
+        - Time penalty to discourage hovering
+        """
+        wp0 = wp_tensor.squeeze(0)[:3]
+        pos = torch.as_tensor(obs["drone_pos"], dtype=torch.float32, device=wp0.device)
+
+        dist = torch.norm(wp0 - pos).item()
+
+        if self._prev_wp_dist is None:
+            progress = 0.0
+        else:
+            progress = self._prev_wp_dist - dist
+
+        self._prev_wp_dist = dist
+
+        # Normalised distance penalty (bounded to roughly [-1, 0])
+        max_dist = 25.0  # rough max distance you'd ever expect
+        dist_penalty = -dist / max_dist
+
+        # Progress reward (positive when closing in)
+        progress_reward = float(np.clip(progress, -1.0, 1.0))
+
+        # Reach bonus (keep it meaningful but not 16x everything else)
+        reach_bonus = 5.0 if dist <= self.cfg.safety_radius else 0.0
+
+        # Small time penalty to discourage hovering
+        time_penalty = -0.01
+
+        return dist_penalty + progress_reward + reach_bonus + time_penalty
 
     # ----- PPO update -----------------------------------------------------
 
@@ -868,8 +973,11 @@ class PPOTrainer:
         total_entropy = 0.0
         total_kl = 0.0
         num_batches = 0
+        early_stop = False
 
         for _ in range(self.ppo_epochs):
+            if early_stop:
+                break
             for batch in self.buffer.sample_batches(self.batch_size):
                 obs = batch["obs"]
                 actions = batch["actions"]
@@ -878,8 +986,8 @@ class PPOTrainer:
                 returns = batch["returns"]
 
                 # Re-evaluate under current policy
-                new_log_probs, entropy, values = (
-                    self.agent.policy.evaluate_actions(obs, actions)
+                new_log_probs, entropy, values = self.agent.policy.evaluate_actions(
+                    obs, actions
                 )
                 values = values.squeeze(-1)
 
@@ -887,8 +995,7 @@ class PPOTrainer:
                 ratio = (new_log_probs - old_log_probs).exp()
                 surr1 = ratio * advantages
                 surr2 = (
-                    torch.clamp(ratio, 1.0 - self.cfg.clip_eps,
-                                1.0 + self.cfg.clip_eps)
+                    torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps)
                     * advantages
                 )
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -897,14 +1004,17 @@ class PPOTrainer:
                 value_loss = F.mse_loss(values, returns)
 
                 # --- total loss --------------------------------------------
-                loss = (policy_loss
-                        + self.cfg.value_coef * value_loss
-                        - self.cfg.entropy_coef * entropy.mean())
+                loss = (
+                    policy_loss
+                    + self.cfg.value_coef * value_loss
+                    - self.cfg.entropy_coef * entropy.mean()
+                )
 
                 self.optimiser.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
-                    self.agent.policy.parameters(), self.cfg.max_grad_norm,
+                    self.agent.policy.parameters(),
+                    self.cfg.max_grad_norm,
                 )
                 self.optimiser.step()
 
@@ -912,17 +1022,22 @@ class PPOTrainer:
                 with torch.no_grad():
                     approx_kl = (old_log_probs - new_log_probs).mean().item()
                 total_policy_loss += policy_loss.item()
-                total_value_loss  += value_loss.item()
-                total_entropy     += entropy.mean().item()
-                total_kl          += approx_kl
-                num_batches       += 1
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.mean().item()
+                total_kl += approx_kl
+                num_batches += 1
+
+                # KL early stopping
+                if abs(approx_kl) > self.cfg.target_kl:
+                    early_stop = True
+                    break
 
         n = max(num_batches, 1)
         return {
             "policy_loss": total_policy_loss / n,
-            "value_loss":  total_value_loss / n,
-            "entropy":     total_entropy / n,
-            "approx_kl":   total_kl / n,
+            "value_loss": total_value_loss / n,
+            "entropy": total_entropy / n,
+            "approx_kl": total_kl / n,
         }
 
     # ----- helpers --------------------------------------------------------
@@ -945,29 +1060,49 @@ class PPOTrainer:
             imu = torch.as_tensor(imu, dtype=torch.float32)
         imu = imu.to(device)
 
-        drone_pos = tuple(float(x) for x in obs["drone_pos"][:3])
-        wp_tensor = self.agent._buffer.current_targets_tensor(
-            drone_pos, device=device,
+        assert self.agent._buffer is not None, "Call agent.set_route() before training."
+        pos = obs["drone_pos"]
+        drone_pos: Tuple[float, float, float] = (
+            float(pos[0]),
+            float(pos[1]),
+            float(pos[2]),
         )
-        return cam, imu, wp_tensor
+        wp_tensor = self.agent._buffer.current_targets_tensor(
+            drone_pos,
+            device=device,
+        )
+
+        # Convert waypoints from world frame to relative offset, then normalize
+        # wp_tensor shape: (1, 6) where 6 = [wp0_x, wp0_y, wp0_z, wp1_x, wp1_y, wp1_z]
+        drone_pos_tensor = torch.tensor(
+            [[pos[0], pos[1], pos[2], pos[0], pos[1], pos[2]]],
+            dtype=torch.float32,
+            device=device,
+        )
+        wp_relative = wp_tensor - drone_pos_tensor
+        wp_normalized = wp_relative / 25.0  # scale to roughly [-1, 1]
+
+        return cam, imu, wp_normalized
 
 
 # ---------------------------------------------------------------------------
 # Curriculum  — progressive route difficulty
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CurriculumStage:
     """Defines one difficulty level in the training curriculum."""
+
     name: str
-    num_waypoints: int          # how many WPs per episode
-    min_spacing: float          # minimum distance between consecutive WPs (m)
-    max_spacing: float          # maximum distance
-    max_angle_deg: float        # max heading change between consecutive WPs
-    safety_radius: float        # waypoint reach threshold (can relax early on)
-    altitude_range: Tuple[float, float] = (3.0, 7.0)   # (min_z, max_z)
-    success_threshold: float = 0.8   # fraction of WPs reached to "pass"
-    min_episodes: int = 50           # minimum episodes before promotion
+    num_waypoints: int  # how many WPs per episode
+    min_spacing: float  # minimum distance between consecutive WPs (m)
+    max_spacing: float  # maximum distance
+    max_angle_deg: float  # max heading change between consecutive WPs
+    safety_radius: float  # waypoint reach threshold (can relax early on)
+    altitude_range: Tuple[float, float] = (3.0, 7.0)  # (min_z, max_z)
+    success_threshold: float = 0.8  # fraction of WPs reached to "pass"
+    min_episodes: int = 50  # minimum episodes before promotion
 
 
 class CurriculumScheduler:
@@ -1102,8 +1237,10 @@ class CurriculumScheduler:
 
         promoted = False
         stage = self.current_stage
-        if (len(self._history) >= stage.min_episodes
-                and self.success_rate >= stage.success_threshold):
+        if (
+            len(self._history) >= stage.min_episodes
+            and self.success_rate >= stage.success_threshold
+        ):
             promoted = self._promote()
 
         return promoted
@@ -1155,12 +1292,12 @@ class CurriculumScheduler:
             CurriculumStage(
                 name="hover_to_point",
                 num_waypoints=2,
-                min_spacing=3.0,
-                max_spacing=6.0,
+                min_spacing=2.0,
+                max_spacing=4.0,
                 max_angle_deg=15.0,
-                safety_radius=2.0,
-                success_threshold=0.75,
-                min_episodes=30,
+                safety_radius=3.0,
+                success_threshold=0.20,
+                min_episodes=15,
             ),
             CurriculumStage(
                 name="short_legs",
@@ -1169,8 +1306,8 @@ class CurriculumScheduler:
                 max_spacing=8.0,
                 max_angle_deg=30.0,
                 safety_radius=1.5,
-                success_threshold=0.80,
-                min_episodes=50,
+                success_threshold=0.25,
+                min_episodes=20,
             ),
             CurriculumStage(
                 name="medium_legs",
@@ -1179,8 +1316,8 @@ class CurriculumScheduler:
                 max_spacing=12.0,
                 max_angle_deg=60.0,
                 safety_radius=1.2,
-                success_threshold=0.80,
-                min_episodes=50,
+                success_threshold=0.30,
+                min_episodes=25,
             ),
             CurriculumStage(
                 name="long_and_twisty",
@@ -1189,8 +1326,8 @@ class CurriculumScheduler:
                 max_spacing=15.0,
                 max_angle_deg=90.0,
                 safety_radius=1.0,
-                success_threshold=0.80,
-                min_episodes=80,
+                success_threshold=0.35,
+                min_episodes=40,
             ),
             CurriculumStage(
                 name="full_mission",
@@ -1200,8 +1337,456 @@ class CurriculumScheduler:
                 max_angle_deg=120.0,
                 safety_radius=0.8,
                 altitude_range=(2.0, 10.0),
-                success_threshold=0.85,
-                min_episodes=100,
+                success_threshold=0.40,
+                min_episodes=50,
             ),
         ]
         return cls(stages, window_size=window_size, on_promote=on_promote)
+
+
+# ---------------------------------------------------------------------------
+# Training env — applies position setpoints from actions
+# ---------------------------------------------------------------------------
+
+
+class RLTrainingEnv(PX4GazeboEnv):
+    """
+    PX4GazeboEnv subclass that maps actions to position setpoints.
+
+    Action mapping (ENU frame):
+      action[0] -> delta X (east)
+      action[1] -> delta Y (north)
+      action[2] -> delta Z (up)
+      action[3] -> unused (kept for compatibility)
+    """
+
+    def __init__(
+        self,
+        *args,
+        max_xy_step: float = 1.0,
+        max_z_step: float = 0.5,
+        min_alt: float = 0.8,
+        max_alt: float = 8.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.max_xy_step = max_xy_step
+        self.max_z_step = max_z_step
+        self.min_alt = min_alt
+        self.max_alt = max_alt
+
+    @staticmethod
+    def _enu_to_ned(pos_enu: np.ndarray) -> Tuple[float, float, float]:
+        """Convert ENU position to NED (PX4 expects NED)."""
+        x_ned = float(pos_enu[1])
+        y_ned = float(pos_enu[0])
+        z_ned = float(-pos_enu[2])
+        return x_ned, y_ned, z_ned
+
+    def _apply_action(self, action: np.ndarray) -> None:
+        action = np.asarray(action, dtype=np.float32)
+        action = np.clip(action, -1.0, 1.0)
+
+        # Use last obs as current state (updated each env.step)
+        obs = self._prev_obs if self._prev_obs is not None else self._sensors.get_obs()
+        pos = obs[0:3].astype(np.float32)
+
+        delta = np.array(
+            [
+                action[0] * self.max_xy_step,
+                action[1] * self.max_xy_step,
+                action[2] * self.max_z_step,
+            ],
+            dtype=np.float32,
+        )
+        target = pos + delta
+        target[2] = float(np.clip(target[2], self.min_alt, self.max_alt))
+
+        x_ned, y_ned, z_ned = self._enu_to_ned(target)
+        px4_cmd.publish_setpoint(x_ned, y_ned, z_ned)
+
+
+# ---------------------------------------------------------------------------
+# Environment wrapper — converts flat obs to policy obs dict
+# ---------------------------------------------------------------------------
+
+
+class ObsWrapper:
+    """
+    Wraps the PX4GazeboEnv to convert flat numpy observations into
+    the dict format expected by the policy.
+
+    The raw env returns: [pos(3) vel(3) quat(4) ang_vel(3) lin_acc(3)] = 16 dims
+    We convert it to: {"cam": (3,64,64), "imu": (6,), "drone_pos": (3,)}
+
+    Since the raw env doesn't provide camera images, we generate dummy
+    visual features (zeros). Replace with real camera data if available.
+    """
+
+    def __init__(self, env, cam_height: int = 64, cam_width: int = 64):
+        self.env = env
+        self.cam_height = cam_height
+        self.cam_width = cam_width
+
+    def _raw_obs_to_dict(self, raw_obs: np.ndarray, reset: bool = False) -> dict:
+        """
+        Convert raw observation to policy dict.
+
+        raw_obs layout: [pos(3) vel(3) quat(4) ang_vel(3) lin_acc(3)]
+        """
+        # Extract components
+        pos = raw_obs[0:3]  # position (ENU)
+        vel = raw_obs[3:6]  # velocity
+        quat = raw_obs[6:10]  # quaternion [w, x, y, z]
+        ang_vel = raw_obs[10:13]  # angular velocity (gyro) [gx, gy, gz]
+        lin_acc = raw_obs[13:16]  # linear acceleration [ax, ay, az]
+
+        # Build IMU: [ax, ay, az, gx, gy, gz]
+        imu = np.concatenate([lin_acc, ang_vel]).astype(np.float32)
+        # Normalize IMU: clip to [-20, 20] and scale to [-1, 1]
+        imu = np.clip(imu, -20.0, 20.0) / 20.0
+
+        # Dummy camera: (3, H, W) zeros
+        # In a real scenario, fetch this from Gazebo or a camera sensor
+        cam = np.zeros((3, self.cam_height, self.cam_width), dtype=np.float32)
+
+        return {
+            "cam": cam,
+            "imu": imu,
+            "drone_pos": pos.astype(np.float32),
+        }
+
+    def reset(self, **kwargs):
+        raw_obs, info = self.env.reset(**kwargs)
+        return self._raw_obs_to_dict(raw_obs, reset=True), info
+
+    def step(self, action: np.ndarray):
+        raw_obs, reward, terminated, truncated, info = self.env.step(action)
+        obs = self._raw_obs_to_dict(raw_obs, reset=False)
+        return obs, reward, terminated, truncated, info
+
+    def close(self):
+        return self.env.close()
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the wrapped env."""
+        return getattr(self.env, name)
+
+
+# ---------------------------------------------------------------------------
+# Training entry point
+# ---------------------------------------------------------------------------
+
+
+def train(
+    num_epochs: int = 500,
+    rollout_steps: int = 2048,
+    batch_size: int = 64,
+    ppo_epochs: int = 4,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    save_interval: int = 50,
+    checkpoint_dir: str = "checkpoints",
+    log_dir: str = "logs",
+) -> None:
+    """
+    Main training loop with curriculum learning.
+
+    Prerequisites
+    -------------
+    1. Start the PX4 + Gazebo simulation stack (see ./launch_sim.sh).
+    2. Run this script in another terminal.
+
+    The trainer will:
+    - Progress through curriculum stages as the agent improves.
+    - Save checkpoints periodically.
+    - Log metrics for TensorBoard.
+
+    Args:
+        num_epochs:     Total number of training epochs.
+        rollout_steps:  Transitions per rollout (PPO buffer size).
+        batch_size:     Mini-batch size for PPO updates.
+        ppo_epochs:     Number of PPO optimisation passes per rollout.
+        device:         "cuda" or "cpu".
+        save_interval:  Save checkpoint every N epochs.
+        checkpoint_dir: Directory for model checkpoints.
+        log_dir:        Directory for TensorBoard logs.
+    """
+    import os
+
+    # Ensure directories exist
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Optional TensorBoard logging
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+
+        writer = SummaryWriter(log_dir=log_dir)
+        use_tb = True
+    except ImportError:
+        writer = None
+        use_tb = False
+        print("[WARN] TensorBoard not available; install tensorboard for logging.")
+
+    print(f"[INFO] Training on device: {device}")
+    print(f"[INFO] Checkpoints will be saved to: {checkpoint_dir}")
+
+    # --- Create environment -------------------------------------------------
+    # Ensure px4_gz_gym package is in the path
+    import sys
+
+    pkg_path = os.path.dirname(os.path.abspath(__file__))
+    if pkg_path not in sys.path:
+        sys.path.insert(0, pkg_path)
+
+    # Import and explicitly register PX4Gz-v0
+    try:
+        from px4_gz_gym.registration import register_envs
+
+        register_envs()
+        print("[INFO] Successfully registered PX4Gz-v0 environment")
+    except ImportError as e:
+        print(f"[ERROR] Could not import px4_gz_gym: {e}")
+        print(
+            f"[INFO] Make sure you're running from /workspace/src or install with: pip install -e ."
+        )
+        raise
+
+    # --- Create curriculum --------------------------------------------------
+    def on_promote(old_stage: CurriculumStage, new_stage: CurriculumStage):
+        print(f"\n[CURRICULUM] Promoted: {old_stage.name} → {new_stage.name}\n")
+
+    curriculum = CurriculumScheduler.default(on_promote=on_promote)
+
+    # --- Create agent & trainer ---------------------------------------------
+    cfg = ModelConfig()
+    cfg.safety_radius = curriculum.current_stage.safety_radius
+
+    # --- Create environment -------------------------------------------------
+    raw_env = RLTrainingEnv(
+        world_name="default",
+        model_name="x500_0",
+        base_model="x500",
+        n_gz_steps=10,
+        step_size=0.004,
+        action_dim=cfg.action_dim,
+        max_episode_steps=400,
+        takeoff_alt=2.5,
+        max_xy_step=1.0,
+        max_z_step=0.5,
+    )
+    env = ObsWrapper(raw_env, cam_height=cfg.cam_height, cam_width=cfg.cam_width)
+
+    # Generate initial route
+    initial_route = curriculum.generate_route(start=(0.0, 0.0, 2.5))
+    agent = DroneAgent(cfg=cfg, route=initial_route, device=device)
+
+    trainer = PPOTrainer(
+        agent=agent,
+        cfg=cfg,
+        rollout_steps=rollout_steps,
+        batch_size=batch_size,
+        ppo_epochs=ppo_epochs,
+        num_epochs=num_epochs,
+    )
+
+    # --- Training loop ------------------------------------------------------
+    print(f"\n{'='*80}")
+    print(f"Starting PPO training — {num_epochs} epochs")
+    print(f"Device: {device}")
+    print(f"Initial curriculum stage: {curriculum.current_stage.name}")
+    print(f"Rollout steps per epoch: {rollout_steps}")
+    print(f"PPO epochs per update: {ppo_epochs}")
+    print(f"{'='*80}\n")
+
+    import time
+
+    global_step = 0
+    epoch_start_time = time.time()
+
+    for epoch in range(1, num_epochs + 1):
+        step_start = time.time()
+
+        # --- Generate new route for this epoch using curriculum ---------------
+        print(f"\n[Epoch {epoch:4d}/{num_epochs}] ", end="", flush=True)
+        route = curriculum.generate_route(start=(0.0, 0.0, 2.5))
+        agent.set_route(route)
+        agent.cfg.safety_radius = curriculum.current_stage.safety_radius
+        print(
+            f"Route: {curriculum.current_stage.num_waypoints} WPs | ",
+            end="",
+            flush=True,
+        )
+
+        # --- Collect rollout -----
+        collect_start = time.time()
+        rollout_info = trainer.collect_rollout(env, route)
+        collect_time = time.time() - collect_start
+        print(
+            f"Collected {rollout_steps} steps in {collect_time:.1f}s | ",
+            end="",
+            flush=True,
+        )
+
+        # --- PPO update -----
+        update_start = time.time()
+        update_stats = trainer.update()
+        update_time = time.time() - update_start
+        print(f"PPO update in {update_time:.1f}s")
+
+        # --- Report to curriculum ---
+        waypoints_reached = agent.waypoints_reached
+        total_waypoints = curriculum.current_stage.num_waypoints
+        promoted = curriculum.report(waypoints_reached, total_waypoints)
+
+        global_step += rollout_steps
+        step_time = time.time() - step_start
+
+        # --- Compute metrics ---
+        avg_reward = rollout_info["total_reward"] / max(
+            rollout_info["episodes_completed"], 1
+        )
+
+        # --- TensorBoard logging --------
+        if use_tb and writer is not None:
+            writer.add_scalar(
+                "train/total_reward", rollout_info["total_reward"], global_step
+            )
+            writer.add_scalar("train/avg_reward", avg_reward, global_step)
+            writer.add_scalar(
+                "train/episodes", rollout_info["episodes_completed"], global_step
+            )
+            writer.add_scalar("loss/policy", update_stats["policy_loss"], global_step)
+            writer.add_scalar("loss/value", update_stats["value_loss"], global_step)
+            writer.add_scalar("loss/entropy", update_stats["entropy"], global_step)
+            writer.add_scalar("loss/approx_kl", update_stats["approx_kl"], global_step)
+            writer.add_scalar("curriculum/stage", curriculum.stage_index, global_step)
+            writer.add_scalar(
+                "curriculum/success_rate", curriculum.success_rate, global_step
+            )
+            writer.add_scalar("waypoints/reached", waypoints_reached, global_step)
+            writer.add_scalar("timing/epoch_time", step_time, global_step)
+
+        # --- Print detailed progress ---
+        progress_pct = (epoch / num_epochs) * 100
+        elapsed = time.time() - epoch_start_time
+        avg_time_per_epoch = elapsed / epoch
+        eta_seconds = avg_time_per_epoch * (num_epochs - epoch)
+        eta_min = int(eta_seconds // 60)
+
+        print(
+            f"  └─ Progress: {progress_pct:5.1f}% | "
+            f"Reward: {avg_reward:7.2f} (total: {rollout_info['total_reward']:8.0f}) | "
+            f"Episodes: {rollout_info['episodes_completed']:2d} | "
+            f"WPs: {waypoints_reached}/{total_waypoints} | "
+            f"Success rate: {curriculum.success_rate:.1%}"
+        )
+        print(
+            f"     Losses: π={update_stats['policy_loss']:.4f} | "
+            f"v={update_stats['value_loss']:.4f} | "
+            f"entropy={update_stats['entropy']:.4f} | "
+            f"KL={update_stats['approx_kl']:.4f}"
+        )
+        print(
+            f"     Stage: {curriculum.current_stage.name:16s} | "
+            f"Epoch time: {step_time:.1f}s | "
+            f"ETA: {eta_min:3d}m | "
+            f"Total elapsed: {elapsed/60:.1f}m"
+        )
+
+        # --- Curriculum promotion ---
+        if promoted:
+            if curriculum.finished:
+                print(f"\n    🎓 [CURRICULUM] COMPLETE! Graduated from all stages!")
+            else:
+                print(
+                    f"    📚 [CURRICULUM] Promoted to stage: {curriculum.current_stage.name}"
+                )
+
+        # --- Learning rate schedule step ---
+        trainer.scheduler.step()
+
+        # --- Save checkpoint ---
+        if epoch % save_interval == 0:
+            ckpt_path = os.path.join(checkpoint_dir, f"policy_epoch_{epoch}.pt")
+            agent.save(ckpt_path)
+            print(f"    💾 [CHECKPOINT] Saved to: {ckpt_path}")
+
+        # --- Check if curriculum finished ---
+        if curriculum.finished:
+            print(f"\n{'='*80}")
+            print(f"[SUCCESS] Curriculum completed after {epoch} epochs!")
+            print(f"{'='*80}\n")
+            break
+
+    # --- Final save ---------------------------------------------------------
+    final_path = os.path.join(checkpoint_dir, "policy_final.pt")
+    agent.save(final_path)
+
+    total_time = time.time() - epoch_start_time
+    total_mins = int(total_time // 60)
+    total_secs = int(total_time % 60)
+
+    print(f"\n{'='*80}")
+    print(f"[TRAINING COMPLETE]")
+    print(f"  • Epochs completed: {epoch}/{num_epochs}")
+    print(f"  • Total time: {total_mins}m {total_secs}s")
+    print(
+        f"  • Final curriculum stage: {curriculum.current_stage.name if not curriculum.finished else 'ALL STAGES COMPLETED'}"
+    )
+    print(f"  • Final success rate: {curriculum.success_rate:.1%}")
+    print(f"  • Model saved to: {final_path}")
+    print(f"  • Checkpoints dir: {checkpoint_dir}")
+    if use_tb:
+        print(f"  • TensorBoard logs: tensorboard --logdir {log_dir}")
+    print(f"{'='*80}\n")
+
+    if use_tb and writer is not None:
+        writer.close()
+
+    env.close()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Train drone waypoint navigation with PPO + curriculum learning"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=500, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--rollout-steps", type=int, default=2048, help="Steps per rollout"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64, help="PPO mini-batch size"
+    )
+    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO update epochs")
+    parser.add_argument("--device", type=str, default="auto", help="cuda, cpu, or auto")
+    parser.add_argument(
+        "--save-interval", type=int, default=50, help="Checkpoint interval"
+    )
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory"
+    )
+    parser.add_argument(
+        "--log-dir", type=str, default="logs", help="TensorBoard log directory"
+    )
+
+    args = parser.parse_args()
+
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    train(
+        num_epochs=args.epochs,
+        rollout_steps=args.rollout_steps,
+        batch_size=args.batch_size,
+        ppo_epochs=args.ppo_epochs,
+        device=device,
+        save_interval=args.save_interval,
+        checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.log_dir,
+    )

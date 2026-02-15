@@ -472,6 +472,16 @@ def publish_offboard_heartbeat(
     node.publish_setpoint(x, y, z_ned)
 
 
+def publish_setpoint(
+    x: float,
+    y: float,
+    z: float,
+) -> None:
+    """Publish a position setpoint in NED frame (PX4 native)."""
+    node = _ensure_node()
+    node.publish_setpoint(x, y, z)
+
+
 def force_disarm() -> None:
     """Immediately force-disarm the vehicle (no landing)."""
     node = _ensure_node()
