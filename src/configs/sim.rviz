@@ -127,8 +127,8 @@ Visualization Manager:
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Best Effort
-        Value: /mavros/local_position/pose
+        Reliability Policy: Reliable
+        Value: /px4/pose
       Value: true
   Enabled: true
   Global Options:
@@ -176,25 +176,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 9.779884338378906
+      Distance: 11.003799438476562
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.11441049724817276
-        Y: 0.20405186712741852
-        Z: 0.9805861115455627
+        X: 0.06657352298498154
+        Y: 0.6042234301567078
+        Z: -0.6485766172409058
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5303993821144104
+      Pitch: 0.7104003429412842
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.6036219596862793
+      Yaw: 1.5786329507827759
     Saved: ~
 Window Geometry:
   Displays:

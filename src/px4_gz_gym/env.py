@@ -329,29 +329,35 @@ class PX4GazeboEnv(gym.Env):
 
         # ── 2. Teleport to spawn pose (paused, fast path) ──
         #    Uses the persistent helper subprocess for set_pose
-        #    (< 1 ms per call vs ~260 ms CLI).  Slam pose twice
-        #    while paused, then step physics to let the solver
-        #    damp out residual velocity.  No time.sleep needed.
+        #    (< 1 ms per call vs ~260 ms CLI).  Slam pose several
+        #    times while paused with short physics bursts to let the
+        #    solver damp out residual velocity.  More iterations with
+        #    fewer steps per iteration converges faster than fewer
+        #    iterations with more steps (velocity gets re-zeroed each
+        #    time set_pose fires).
         with _prof.measure("reset/2_teleport"):
             _spawn_pos = (0.0, 0.0, 0.0)
             _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
-            # Set pose while paused — two calls to be safe
+            for _slam_i in range(5):
+                self._gz.set_model_pose(
+                    self.model_name,
+                    position=_spawn_pos,
+                    orientation=_spawn_ori,
+                )
+                _step(10)
+            # Final pose correction after last physics burst
             self._gz.set_model_pose(
                 self.model_name,
                 position=_spawn_pos,
                 orientation=_spawn_ori,
             )
-            # Step 25 physics steps (0.1s sim-time) to let
-            # the physics solver damp residual velocities
-            _step(25)
-            # Slam pose again after damping to correct any drift
-            self._gz.set_model_pose(
-                self.model_name,
-                position=_spawn_pos,
-                orientation=_spawn_ori,
-            )
-            # Final damping: 25 more steps
-            _step(25)
+
+        # ── 2b. Zero cached sensor state ────────────────────
+        #    _vel / _ang_vel may still hold stale values from the
+        #    previous episode because the odom callback only fires
+        #    when PX4's gz-bridge is active.  Explicitly zero them
+        #    so the first observation of the new episode is clean.
+        self._sensors.reset_state()
 
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
         with _prof.measure("reset/3_restart_px4"):
@@ -360,11 +366,13 @@ class PX4GazeboEnv(gym.Env):
         # Give PX4 modules sim-time to re-initialise.
         # 250 steps = 1 s sim-time — enough for EKF2 to converge.
         with _prof.measure("reset/4_ekf_converge"):
-            _step(250)
+            _step(150)
 
         # ── 4. Clear sensor buffers for fresh episode ───────
+        #    (Already done by reset_state() in step 2b for vel/imu,
+        #     but clear again after EKF convergence stepping to
+        #     discard any IMU samples accumulated during convergence.)
         self._sensors.clear_imu_buffer()
-        self._sensors.clear_trajectory()
 
         # ── 5. Wait for PX4 DDS connection (sim-stepped) ───
         with _prof.measure("reset/5_dds_connect"):

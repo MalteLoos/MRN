@@ -300,6 +300,22 @@ class GzSensors:
                 ]
             ).astype(np.float32)
 
+    def reset_state(self) -> None:
+        """Zero all cached velocity / acceleration state for a clean
+        episode start.
+
+        Must be called during ``env.reset()`` **after** teleporting
+        the model, so that the first observation does not carry stale
+        velocity or angular-velocity values from the previous episode
+        (the odom callback may not have fired yet at that point).
+        """
+        with self._lock:
+            self._vel[:] = 0.0
+            self._ang_vel[:] = 0.0
+            self._lin_acc[:] = 0.0
+            self._imu_buffer.clear()
+            self._trajectory.clear()
+
     def clear_imu_buffer(self) -> None:
         """Clear buffered IMU readings (call on episode reset)."""
         with self._lock:
