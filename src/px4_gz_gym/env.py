@@ -494,21 +494,30 @@ class PX4GazeboEnv(gym.Env):
         yaw_rate_cmd = float(action[2]) * self.max_yaw_rate
         thrust_cmd = float(np.clip((action[3] + 1.0) / 2.0, 0.0, 1.0))
 
-        # Current yaw from latest sensor reading
+        # Current yaw from latest sensor reading (ENU quaternion)
         state = self._sensors.get_state_dict()
-        q = state["orientation"]  # [w, x, y, z]
-        current_yaw = math.atan2(
+        q = state["orientation"]  # [w, x, y, z]  — ENU frame
+        current_yaw_enu = math.atan2(
             2.0 * (q[0] * q[3] + q[1] * q[2]),
             1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2),
         )
 
-        # Integrate yaw rate over one time-step
-        yaw_cmd = current_yaw + yaw_rate_cmd * self.dt
+        # Integrate yaw rate over one time-step (still ENU)
+        yaw_enu = current_yaw_enu + yaw_rate_cmd * self.dt
+
+        # ── ENU → NED conversion for PX4 ──────────────────
+        # PX4 expects NED Euler angles:
+        #   NED roll  =  ENU roll   (same axis convention)
+        #   NED pitch = -ENU pitch  (nose-down positive in NED)
+        #   NED yaw   =  pi/2 - ENU yaw  (90° rotation N↔E)
+        roll_ned = roll_cmd
+        pitch_ned = -pitch_cmd
+        yaw_ned = math.pi / 2.0 - yaw_enu
 
         px4_cmd.publish_attitude_command(
-            roll=roll_cmd,
-            pitch=pitch_cmd,
-            yaw=yaw_cmd,
+            roll=roll_ned,
+            pitch=pitch_ned,
+            yaw=yaw_ned,
             thrust=thrust_cmd,
         )
 
