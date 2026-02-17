@@ -182,8 +182,29 @@ class HoverEnvWrapper:
         # tilt penalty — cos(tilt) = 1 - 2(qx² + qy²), so
         # tilt_penalty = 0 when upright, grows as drone tilts.
         q = obs["drone_quat"]  # (w, x, y, z)
-        cos_tilt = 1.0 - 2.0 * (float(q[1]) ** 2 + float(q[2]) ** 2)
+        qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        cos_tilt = 1.0 - 2.0 * (qx**2 + qy**2)
         tilt_penalty = 1.0 - cos_tilt  # 0 upright, 2 inverted
+
+        # "don't dig deeper" penalty — if already tilted > 35°,
+        # punish attitude commands that push further in the same
+        # direction.  Extract roll/pitch from the quaternion and
+        # penalise when the commanded roll/pitch rate has the same
+        # sign as the current lean.
+        TILT_THRESH_RAD = math.radians(30.0)
+        roll = math.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx**2 + qy**2))
+        pitch = math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx))))
+
+        same_dir_penalty = 0.0
+        if abs(roll) > TILT_THRESH_RAD:
+            # action[0] = roll rate; positive sign = same direction as lean
+            overlap = float(action[0]) * roll  # >0 means pushing further
+            if overlap > 0:
+                same_dir_penalty += overlap * 3.0
+        if abs(pitch) > TILT_THRESH_RAD:
+            overlap = float(action[1]) * pitch
+            if overlap > 0:
+                same_dir_penalty += overlap * 3.0
 
         reward = (
             -1.0 * alt_err
@@ -192,6 +213,7 @@ class HoverEnvWrapper:
             - 0.05 * act_mag
             - low_thrust_penalty
             - 1.0 * tilt_penalty
+            - same_dir_penalty
             + 0.1  # alive bonus
         )
         return reward

@@ -528,7 +528,7 @@ class PX4GazeboEnv(gym.Env):
         reward -= 0.01 * float(np.sum(action**2))
         return float(reward)
 
-    MAX_TILT_RAD: float = math.radians(45.0)
+    MAX_TILT_RAD: float = math.radians(60.0)
 
     def _is_terminated(self, obs: dict[str, np.ndarray]) -> bool:
         """Default: terminate if below ground, way too high, or
