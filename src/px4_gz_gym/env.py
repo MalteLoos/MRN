@@ -281,13 +281,10 @@ class PX4GazeboEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
 
         # 1. Apply action → PX4 attitude setpoint ───────────
+        #    publish_attitude_command() already sends both the
+        #    OffboardControlMode heartbeat AND the attitude setpoint,
+        #    so no separate heartbeat is needed here.
         self._apply_action(action)
-
-        # 1b. Offboard heartbeat (attitude mode) — keeps PX4
-        #     in OFFBOARD even if setpoint is slightly delayed.
-        px4_cmd.publish_offboard_attitude_heartbeat(
-            thrust=0.5,
-        )
 
         # 2. Step Gazebo ─────────────────────────────────────
         sim_time = self._gz.step_and_wait(
