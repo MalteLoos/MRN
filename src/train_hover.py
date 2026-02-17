@@ -173,11 +173,11 @@ class HoverEnvWrapper:
         # action penalty (exclude thrust)
         act_mag = float(np.sum(action[:3] ** 2))
 
-        # thrust penalty — penalise thrust below 0.3 so the
+        # thrust penalty — penalise thrust below 0.35 so the
         # policy learns to keep the motors spinning.  action[3]
         # is in [-1, 1]; actual thrust = (action[3]+1)/2.
-        thrust = float(action[3])
-        low_thrust_penalty = max(0.0, 0.35 - abs(thrust)) * 5.0  # up to 1.5
+        actual_thrust = (float(action[3]) + 1.0) / 2.0  # [0, 1]
+        low_thrust_penalty = max(0.0, 0.35 - actual_thrust) * 5.0  # up to 1.75
 
         # tilt penalty — cos(tilt) = 1 - 2(qx² + qy²), so
         # tilt_penalty = 0 when upright, grows as drone tilts.
