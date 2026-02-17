@@ -176,8 +176,8 @@ class HoverEnvWrapper:
         # thrust penalty — penalise thrust below 0.3 so the
         # policy learns to keep the motors spinning.  action[3]
         # is in [-1, 1]; actual thrust = (action[3]+1)/2.
-        thrust = float(action[3] + 1.0) / 2.0
-        low_thrust_penalty = max(0.0, 0.3 - thrust) * 5.0  # up to 1.5
+        thrust = float(action[3])
+        low_thrust_penalty = max(0.0, 0.35 - abs(thrust)) * 5.0  # up to 1.5
 
         reward = (
             -1.0 * alt_err
