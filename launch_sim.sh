@@ -24,7 +24,7 @@ ROS_DOMAIN_ID="${2:-0}"                         # ROS 2 domain isolation
 PX4_GZ_WORLD="${3:-tugbot_depot}"                    # Gazebo world / map name
 PX4_HOME="${PX4_HOME:-/opt/PX4-Autopilot}"      # PX4 source tree
 PX4_PARAMS_FILE="${PX4_PARAMS_FILE:-/workspace/px4.params}"  # QGC text format params
-SESSION="px4sim"                                # tmux session name
+SESSION="${SESSION:-px4sim}"                    # tmux session name
 DDS_PORT="8888"                                 # XRCE-DDS UDP port
 FCU_URL="udp://:14540@127.0.0.1:14557"         # MAVROS ↔ PX4 link
 

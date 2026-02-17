@@ -139,6 +139,11 @@ class HoverEnvWrapper:
         done = terminated or (self._step_count >= self.max_steps)
         return mapped, reward, done, info
 
+    def publish_waypoints_relative(self, wp_flat) -> None:
+        """Forward body-frame waypoint tensor to ROS 2 for debugging."""
+        if hasattr(self.env, "publish_waypoints_relative"):
+            self.env.publish_waypoints_relative(wp_flat)
+
     # ── hover-centric reward ───────────────────────────────────────────────
 
     def _compute_hover_reward(
@@ -168,11 +173,18 @@ class HoverEnvWrapper:
         # action penalty (exclude thrust)
         act_mag = float(np.sum(action[:3] ** 2))
 
+        # thrust penalty — penalise thrust below 0.3 so the
+        # policy learns to keep the motors spinning.  action[3]
+        # is in [-1, 1]; actual thrust = (action[3]+1)/2.
+        thrust = float(action[3] + 1.0) / 2.0
+        low_thrust_penalty = max(0.0, 0.3 - thrust) * 5.0  # up to 1.5
+
         reward = (
             -1.0 * alt_err
             - 0.5 * horiz_drift
             - 0.2 * speed
             - 0.05 * act_mag
+            - low_thrust_penalty
             + 0.1  # alive bonus
         )
         return reward
@@ -260,7 +272,9 @@ class DummyHoverEnv:
         horiz = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
         speed = float(np.linalg.norm(vel))
         act_mag = float(np.sum(action[:3] ** 2))
-        return -1.0 * alt_err - 0.5 * horiz - 0.2 * speed - 0.05 * act_mag + 0.1
+        thrust = float(action[3] + 1.0) / 2.0
+        low_thrust_penalty = max(0.0, 0.3 - thrust) * 5.0
+        return -1.0 * alt_err - 0.5 * horiz - 0.2 * speed - 0.05 * act_mag - low_thrust_penalty + 0.1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -268,8 +282,17 @@ class DummyHoverEnv:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def make_env(args) -> HoverEnvWrapper | DummyHoverEnv:
-    """Build the hover environment (real or dummy)."""
+def make_env(args):
+    """Build the hover environment (real, dummy, or vectorised).
+
+    Returns
+    -------
+    HoverEnvWrapper | DummyHoverEnv
+        When ``--num-envs 1`` (default, single-process).
+    SubprocVecEnv
+        When ``--num-envs N`` with N > 1 (multi-process, each
+        worker has its own PX4 + Gazebo stack).
+    """
     if args.dummy:
         return DummyHoverEnv(
             hover_alt=args.hover_alt,
@@ -278,7 +301,21 @@ def make_env(args) -> HoverEnvWrapper | DummyHoverEnv:
             cam_w=args.cam_size,
         )
 
-    # Real PX4 + Gazebo environment
+    num_envs = getattr(args, "num_envs", 1)
+
+    if num_envs > 1:
+        # Multi-process: each worker gets its own sim stack
+        from px4_gz_gym.vec_env import SubprocVecEnv
+
+        launch_script = getattr(args, "launch_script", "")
+        return SubprocVecEnv.from_args(
+            num_envs=num_envs,
+            args=args,
+            base_domain_id=10,
+            launch_script=launch_script,
+        )
+
+    # Single-process: direct PX4GazeboEnv
     from px4_gz_gym.env import PX4GazeboEnv
 
     raw_env = PX4GazeboEnv(
@@ -303,7 +340,7 @@ def collect_rollout(
     cfg: ModelConfig,
 ) -> dict[str, float]:
     """
-    Collect ``rollout_steps`` transitions from the hover env.
+    Collect ``rollout_steps`` transitions from a **single** env.
 
     Handles the dual-rate update: vision is only updated when the env
     signals ``new_frame``; the fast path runs every tick.
@@ -312,9 +349,8 @@ def collect_rollout(
     agent.reset_vision()
     obs = env.reset()
 
-    # Set a trivial hover route (2 waypoints at the same spot)
-    hp = [float(x) for x in obs["drone_pos"][:3]]
-    hover_pos: Tuple[float, float, float] = (hp[0], hp[1], hp[2])
+    # Set a trivial hover route (2 waypoints at the target hover position)
+    hover_pos: Tuple[float, float, float] = (0.0, 0.0, env.hover_alt)
     agent.set_route([hover_pos, hover_pos])
     assert agent._buffer is not None
 
@@ -342,6 +378,9 @@ def collect_rollout(
             drone_quat=drone_quat,
             device=device,
         )
+
+        # Publish body-frame relative waypoints for RViz debugging
+        env.publish_waypoints_relative(wp_tensor.squeeze(0).cpu().numpy())
 
         vis_feat = agent.policy._vis_feat_cache
         if vis_feat is None:
@@ -374,8 +413,7 @@ def collect_rollout(
         if done:
             obs = env.reset()
             agent.reset_vision()
-            hp = [float(x) for x in obs["drone_pos"][:3]]
-            hover_pos = (hp[0], hp[1], hp[2])
+            hover_pos = (0.0, 0.0, env.hover_alt)
             agent.set_route([hover_pos, hover_pos])
             episodes += 1
         else:
@@ -394,6 +432,204 @@ def collect_rollout(
         drone_pos,
         drone_quat=drone_quat,
         device=device,
+    )
+    vis_feat = agent.policy._vis_feat_cache
+    if vis_feat is None:
+        vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
+    with torch.no_grad():
+        policy_obs = {
+            "imu": imu.unsqueeze(0),
+            "waypoints": wp_tensor,
+            "vis_feat": vis_feat,
+        }
+        _, _, last_value = agent.policy.act(policy_obs)
+    buffer.finish(last_value)
+
+    return {
+        "total_reward": total_reward,
+        "episodes": max(episodes, 1),
+        "mean_reward": total_reward / max(episodes, 1),
+    }
+
+
+def collect_rollout_vec(
+    agent: DroneAgent,
+    vec_env,
+    buffer: RolloutBuffer,
+    rollout_steps: int,
+    cfg: ModelConfig,
+    hover_alt: float = 2.5,
+) -> dict[str, float]:
+    """Collect transitions from **N parallel envs** round-robin.
+
+    Each env steps independently; done envs are reset inline.
+    Transitions from all envs are interleaved into a single
+    ``RolloutBuffer`` in deterministic env-index order.
+
+    The buffer must be sized for ``rollout_steps`` total transitions
+    (spread across all envs).
+
+    Determinism
+    ~~~~~~~~~~~
+    * Each env performs its own deterministic sim-stepped reset.
+    * Results are always processed in env-index order (0, 1, …, N-1)
+      so the buffer contents are reproducible for the same seeds.
+    """
+    from px4_gz_gym.vec_env import SubprocVecEnv, AsyncResetVecEnv
+
+    num_envs = vec_env.num_envs
+    buffer.reset()
+    agent.reset_vision()
+    device = agent.device
+
+    # ── Initial reset of all envs ────────────────────────────
+    if isinstance(vec_env, AsyncResetVecEnv):
+        obs_list = vec_env.reset_all()
+    else:
+        obs_list = vec_env.reset_all()
+
+    # Wrap raw obs in HoverEnvWrapper-style remap
+    def _remap(obs_dict: dict) -> dict:
+        """Raw PX4GazeboEnv obs → model-expected keys."""
+        return {
+            "cam": obs_dict["camera"],
+            "imu": obs_dict["imu"],
+            "drone_pos": obs_dict["position"],
+            "drone_quat": obs_dict["orientation"],
+            "velocity": obs_dict["velocity"],
+            "new_frame": True,  # first frame after reset
+        }
+
+    obs_per_env = [_remap(o) for o in obs_list]
+
+    # Set hover route for agent — target is directly above spawn
+    hover_pos: Tuple[float, float, float] = (0.0, 0.0, hover_alt)
+    agent.set_route([hover_pos, hover_pos])
+    assert agent._buffer is not None
+
+    total_reward = 0.0
+    episodes = 0
+    steps_collected = 0
+
+    while steps_collected < rollout_steps:
+        # ── Compute actions for all envs ─────────────────────
+        actions = []
+        log_probs = []
+        values = []
+        imus = []
+        wp_tensors = []
+        vis_feats = []
+
+        for i in range(num_envs):
+            if steps_collected + i >= rollout_steps:
+                break
+            obs = obs_per_env[i]
+
+            # Slow path: vision
+            if obs.get("new_frame", False) and "cam" in obs:
+                agent.update_vision(obs)
+
+            imu = obs["imu"]
+            if not isinstance(imu, torch.Tensor):
+                imu = torch.as_tensor(imu, dtype=torch.float32)
+            imu = imu.to(device)
+
+            dp = [float(x) for x in obs["drone_pos"][:3]]
+            drone_pos = (dp[0], dp[1], dp[2])
+            dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+            drone_quat = (dq[0], dq[1], dq[2], dq[3])
+            wp_tensor = agent._buffer.current_targets_tensor(
+                drone_pos, drone_quat=drone_quat, device=device,
+            )
+
+            vis_feat = agent.policy._vis_feat_cache
+            if vis_feat is None:
+                vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
+
+            policy_obs = {
+                "imu": imu.unsqueeze(0),
+                "waypoints": wp_tensor,
+                "vis_feat": vis_feat,
+            }
+            action, log_prob, value = agent.policy.act(policy_obs)
+            action_sq = action.squeeze(0)
+
+            actions.append(action_sq.cpu().numpy())
+            log_probs.append(log_prob.squeeze(0))
+            values.append(value)
+            imus.append(imu)
+            wp_tensors.append(wp_tensor.squeeze(0))
+            vis_feats.append(vis_feat.squeeze(0))
+
+        n_active = len(actions)
+        if n_active == 0:
+            break
+
+        # ── Step all active envs in parallel ─────────────────
+        if isinstance(vec_env, AsyncResetVecEnv):
+            step_results = vec_env.step(
+                [np.asarray(a, dtype=np.float32) for a in actions]
+                + [np.zeros(4, dtype=np.float32)] * (num_envs - n_active)
+            )
+        else:
+            step_results = vec_env.step(
+                [np.asarray(a, dtype=np.float32) for a in actions]
+                + [np.zeros(4, dtype=np.float32)] * (num_envs - n_active)
+            )
+
+        # ── Store transitions (deterministic env-index order) ─
+        for i in range(n_active):
+            if steps_collected >= rollout_steps:
+                break
+
+            if isinstance(vec_env, AsyncResetVecEnv):
+                obs_raw, reward, done, info = step_results[i]
+                next_obs_raw = obs_raw
+            else:
+                obs_raw, reward, term, trunc, info = step_results[i]  # type: ignore[misc]
+                done = bool(term or trunc)
+                next_obs_raw = obs_raw
+
+            buffer.store(
+                imu=imus[i],
+                waypoints=wp_tensors[i],
+                vis_feat=vis_feats[i],
+                action=torch.as_tensor(actions[i], dtype=torch.float32).to(device),
+                log_prob=log_probs[i],
+                reward=float(reward),
+                value=values[i],
+                done=done,
+            )
+            total_reward += float(reward)
+            steps_collected += 1
+
+            if done:
+                if isinstance(vec_env, AsyncResetVecEnv):
+                    # Reset obs will be collected on next step
+                    reset_obs = vec_env.get_reset_obs(i)
+                    obs_per_env[i] = _remap(reset_obs)
+                else:
+                    reset_obs = vec_env.reset_one(i)
+                    obs_per_env[i] = _remap(reset_obs)
+                agent.reset_vision()
+                hover_pos = (0.0, 0.0, hover_alt)
+                agent.set_route([hover_pos, hover_pos])
+                episodes += 1
+            else:
+                obs_per_env[i] = _remap(next_obs_raw)
+
+    # ── Bootstrap last value ─────────────────────────────────
+    obs = obs_per_env[0]
+    imu = obs["imu"]
+    if not isinstance(imu, torch.Tensor):
+        imu = torch.as_tensor(imu, dtype=torch.float32).to(device)
+    dp = [float(x) for x in obs["drone_pos"][:3]]
+    drone_pos = (dp[0], dp[1], dp[2])
+    dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+    drone_quat = (dq[0], dq[1], dq[2], dq[3])
+    assert agent._buffer is not None
+    wp_tensor = agent._buffer.current_targets_tensor(
+        drone_pos, drone_quat=drone_quat, device=device,
     )
     vis_feat = agent.policy._vis_feat_cache
     if vis_feat is None:
@@ -577,6 +813,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use a physics-free dummy env for loop testing.",
     )
+    p.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of parallel PX4+Gazebo environments (each gets its own sim stack).",
+    )
+    p.add_argument(
+        "--launch-script",
+        type=str,
+        default="",
+        help="Path to launch_sim.sh for auto-launching per-worker sim stacks. "
+        "Leave empty if sims are already running.",
+    )
 
     # ── checkpointing & logging ─────────────────────────────────────────
     p.add_argument(
@@ -660,6 +909,8 @@ def main() -> None:
 
     # ── Environment ─────────────────────────────────────────────────────
     env = make_env(args)
+    num_envs = getattr(args, "num_envs", 1)
+    use_vec_env = num_envs > 1 and not args.dummy
 
     # ── Parameter summary ───────────────────────────────────────────────
     total_p = sum(p.numel() for p in agent.policy.parameters())
@@ -673,6 +924,7 @@ def main() -> None:
     print(f"║  Frozen (RAFT):{total_p - train_p:<38,d} ║")
     print(f"║  Epochs:       {args.epochs:<38d} ║")
     print(f"║  Rollout steps:{args.rollout_steps:<38d} ║")
+    print(f"║  Num envs:     {num_envs:<38d} ║")
     print(f"║  Episode secs: {args.episode_secs:<38.1f} ║")
     print(f"║  Hover alt:    {args.hover_alt:<38.1f} ║")
     print(f"║  Dummy env:    {str(args.dummy):<38s} ║")
@@ -687,13 +939,23 @@ def main() -> None:
         t0 = time.time()
 
         # 1. Collect rollout
-        rollout_stats = collect_rollout(
-            agent,
-            env,
-            buffer,
-            args.rollout_steps,
-            cfg,
-        )
+        if use_vec_env:
+            rollout_stats = collect_rollout_vec(
+                agent,
+                env,  # type: ignore[arg-type]
+                buffer,
+                args.rollout_steps,
+                cfg,
+                hover_alt=args.hover_alt,
+            )
+        else:
+            rollout_stats = collect_rollout(
+                agent,
+                env,  # type: ignore[arg-type]
+                buffer,
+                args.rollout_steps,
+                cfg,
+            )
 
         # 2. PPO update
         update_stats = ppo_update(
@@ -751,6 +1013,10 @@ def main() -> None:
     # ── Final save ──────────────────────────────────────────────────────
     final_path = os.path.join(args.run_dir, "final.pt")
     save_checkpoint(agent, optimiser, start_epoch + args.epochs - 1, {}, final_path)
+
+    # ── Cleanup ──────────────────────────────────────────────────────────
+    if use_vec_env and hasattr(env, "close"):
+        env.close()  # type: ignore[union-attr]
 
     wandb.finish()
     print("\n✅ Training complete.")

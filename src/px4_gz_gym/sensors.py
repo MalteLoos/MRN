@@ -51,6 +51,7 @@ from rclpy.node import Node as RosNode  # noqa: E402
 from sensor_msgs.msg import Image as RosImage, Imu as RosImu  # noqa: E402
 from geometry_msgs.msg import PoseStamped  # noqa: E402
 from nav_msgs.msg import Path  # noqa: E402
+from std_msgs.msg import Float32MultiArray  # noqa: E402
 
 
 class GzSensors:
@@ -184,10 +185,31 @@ class GzSensors:
             "/drone/trajectory",
             10,
         )
+        self._pub_wp_rel = self._ros_node.create_publisher(
+            Float32MultiArray,
+            "/drone/waypoints_relative",
+            10,
+        )
 
     # ════════════════════════════════════════════════════════
     #  Public API
     # ════════════════════════════════════════════════════════
+
+    def publish_waypoints_relative(self, wp_flat: list[float] | np.ndarray) -> None:
+        """Publish body-frame relative waypoint tensor to ROS 2.
+
+        Parameters
+        ----------
+        wp_flat : list or ndarray, shape (6,)
+            Body-frame relative offsets ``[wp0_x, wp0_y, wp0_z,
+            wp1_x, wp1_y, wp1_z]`` as returned by
+            ``WaypointBuffer.current_targets_tensor()`` (squeezed).
+        """
+        if self._ros_node is None:
+            return
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in wp_flat]
+        self._pub_wp_rel.publish(msg)
 
     def get_obs(self) -> dict[str, np.ndarray]:
         """Return a dict observation (one per env step, ≈ 50 Hz).

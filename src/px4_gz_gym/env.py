@@ -222,54 +222,67 @@ class PX4GazeboEnv(gym.Env):
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         super().reset(seed=seed)
 
-        # ── 1. Force-disarm & unpause ───────────────────────
+        # Helper: advance sim by n physics steps deterministically.
+        # All reset waiting is done through this instead of
+        # time.sleep(), turning ~130 s wall-clock into ~2-5 s.
+        def _step(n: int) -> float:
+            return self._gz.step_and_wait(n, step_size=self.step_size)
+
+        # ── 1. Force-disarm (sim-stepped wait) ──────────────
         px4_cmd.force_disarm()
-        self._gz.unpause()
+        px4_cmd.stepped_wait_for_disarm(
+            _step, steps_per_iter=50, max_iters=50,
+        )
 
-        # ── 2. Wait for PX4 to confirm disarmed ────────────
-        px4_cmd.wait_for_disarm(timeout=5.0)
-
-        # ── 3. Pause & teleport to spawn pose ──────────────
+        # ── 2. Pause & teleport to spawn pose ──────────────
         self._gz.pause()
         self._gz.set_model_pose(
             self.model_name,
             position=(0.0, 0.0, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
-        self._gz.step_and_wait(50, step_size=self.step_size)
+        _step(50)  # settle physics
 
-        # ── 3b. Restart PX4 completely (without restarting Gz) ──
-        #    Kills and relaunches PX4 SITL in standalone mode so
-        #    ALL internal state (EKF2, commander, navigator, etc.)
-        #    is wiped clean for the new episode.
+        # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
+        #    Sleeps inside are minimal (~20 ms for tmux delivery).
+        #    Actual convergence time is provided by sim-stepping below.
         px4_cmd.restart_px4()
+
+        # Give PX4 modules sim-time to re-initialise.
+        # 500 steps = 2 s sim-time — enough for EKF2 to converge
+        # on the new pose.  Wall-clock: ~0.1 s.
+        _step(500)
 
         # ── 4. Clear sensor buffers for fresh episode ───────
         self._sensors.clear_imu_buffer()
         self._sensors.clear_trajectory()
 
-        # ── 5. Unpause & wait for PX4 DDS connection ───────
+        # ── 5. Wait for PX4 DDS connection (sim-stepped) ───
         px4_cmd.clear_state()
-        self._gz.unpause()
-        px4_cmd.wait_for_connection(timeout=30.0)
-
-        # ── 6. Stream offboard mode + position setpoints
-        #    (PX4 requires OffboardControlMode at ≥ 2 Hz for
-        #    ≥ 2 s before accepting the OFFBOARD mode switch) ─
-        px4_cmd.stream_setpoints_and_offboard(
-            n=100,
-            rate_hz=50.0,
-            z_enu=self.takeoff_alt,
+        px4_cmd.stepped_wait_for_connection(
+            _step, steps_per_iter=50, max_iters=300,
         )
 
-        # ── 7. Switch to OFFBOARD (position mode for takeoff)
-        px4_cmd.switch_to_offboard(timeout=10.0)
+        # ── 6. Stream attitude-mode offboard heartbeats ────
+        #    PX4 needs OffboardControlMode at ≥ 2 Hz for ≥ 2 s
+        #    of sim-time before accepting OFFBOARD.  We stream
+        #    in **attitude** mode so the policy can control the
+        #    drone from the ground up (no position controller).
+        px4_cmd.stepped_stream_attitude(
+            _step,
+            sim_seconds=2.0,
+            ticks_per_publish=self.n_gz_steps,
+            step_size=self.step_size,
+        )
 
-        # ── 8. Arm & climb to takeoff altitude ──────────────
-        px4_cmd.arm_and_takeoff(
-            target_alt=self.takeoff_alt,
-            timeout=20.0,
-            get_altitude=lambda: float(self._sensors.get_flat_state()[2]),
+        # ── 7. Switch to OFFBOARD + arm (attitude mode) ────
+        #    No climb phase — the policy takes over from ground.
+        px4_cmd.stepped_offboard_arm(
+            _step,
+            ticks_per_publish=self.n_gz_steps,
+            step_size=self.step_size,
+            offboard_timeout_s=10.0,
+            arm_timeout_s=10.0,
         )
 
         # ── 9. Pause again for deterministic stepping ──────
@@ -279,6 +292,15 @@ class PX4GazeboEnv(gym.Env):
         obs = self._sensors.get_obs()
         info = self._build_info()
         return obs, info
+
+    # ── debug helpers ─────────────────────────────────────────
+
+    def publish_waypoints_relative(
+        self,
+        wp_flat: list[float] | np.ndarray,
+    ) -> None:
+        """Forward body-frame waypoint tensor to ROS 2 for debugging."""
+        self._sensors.publish_waypoints_relative(wp_flat)
 
     def step(
         self,
