@@ -179,12 +179,19 @@ class HoverEnvWrapper:
         thrust = float(action[3])
         low_thrust_penalty = max(0.0, 0.35 - abs(thrust)) * 5.0  # up to 1.5
 
+        # tilt penalty — cos(tilt) = 1 - 2(qx² + qy²), so
+        # tilt_penalty = 0 when upright, grows as drone tilts.
+        q = obs["drone_quat"]  # (w, x, y, z)
+        cos_tilt = 1.0 - 2.0 * (float(q[1]) ** 2 + float(q[2]) ** 2)
+        tilt_penalty = 1.0 - cos_tilt  # 0 upright, 2 inverted
+
         reward = (
             -1.0 * alt_err
             - 0.5 * horiz_drift
             - 0.2 * speed
             - 0.05 * act_mag
             - low_thrust_penalty
+            - 1.0 * tilt_penalty
             + 0.1  # alive bonus
         )
         return reward
@@ -274,7 +281,14 @@ class DummyHoverEnv:
         act_mag = float(np.sum(action[:3] ** 2))
         thrust = float(action[3] + 1.0) / 2.0
         low_thrust_penalty = max(0.0, 0.3 - thrust) * 5.0
-        return -1.0 * alt_err - 0.5 * horiz - 0.2 * speed - 0.05 * act_mag - low_thrust_penalty + 0.1
+        return (
+            -1.0 * alt_err
+            - 0.5 * horiz
+            - 0.2 * speed
+            - 0.05 * act_mag
+            - low_thrust_penalty
+            + 0.1
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -539,7 +553,9 @@ def collect_rollout_vec(
             dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
             drone_quat = (dq[0], dq[1], dq[2], dq[3])
             wp_tensor = agent._buffer.current_targets_tensor(
-                drone_pos, drone_quat=drone_quat, device=device,
+                drone_pos,
+                drone_quat=drone_quat,
+                device=device,
             )
 
             vis_feat = agent.policy._vis_feat_cache
@@ -629,7 +645,9 @@ def collect_rollout_vec(
     drone_quat = (dq[0], dq[1], dq[2], dq[3])
     assert agent._buffer is not None
     wp_tensor = agent._buffer.current_targets_tensor(
-        drone_pos, drone_quat=drone_quat, device=device,
+        drone_pos,
+        drone_quat=drone_quat,
+        device=device,
     )
     vis_feat = agent.policy._vis_feat_cache
     if vis_feat is None:

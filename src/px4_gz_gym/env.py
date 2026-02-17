@@ -243,13 +243,13 @@ class PX4GazeboEnv(gym.Env):
         self._gz.unpause()
         _spawn_pos = (0.0, 0.0, 0.0)
         _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
-        for _ in range(15):
+        for _ in range(10):
             self._gz.set_model_pose(
                 self.model_name,
                 position=_spawn_pos,
                 orientation=_spawn_ori,
             )
-            time.sleep(0.05)
+            time.sleep(0.02)
         self._gz.pause()
 
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
