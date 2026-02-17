@@ -366,7 +366,7 @@ class PX4GazeboEnv(gym.Env):
         # Give PX4 modules sim-time to re-initialise.
         # 250 steps = 1 s sim-time — enough for EKF2 to converge.
         with _prof.measure("reset/4_ekf_converge"):
-            _step(150)
+            _step(500)
 
         # ── 4. Clear sensor buffers for fresh episode ───────
         #    (Already done by reset_state() in step 2b for vel/imu,

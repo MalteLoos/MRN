@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Status1
         - /Pose2/Topic1
+        - /Pose3
       Splitter Ratio: 0.5
     Tree Height: 497
   - Class: rviz_common/Selection
@@ -130,6 +131,50 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /px4/pose
       Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+        base_link:
+          Value: true
+        base_link_gz:
+          Value: true
+        map:
+          Value: true
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Tree:
+        map:
+          base_link:
+            {}
+          base_link_gz:
+            {}
+      Update Interval: 0
+      Value: true
+    - Alpha: 1
+      Axes Length: 1
+      Axes Radius: 0.10000000149011612
+      Class: rviz_default_plugins/Pose
+      Color: 170; 0; 255
+      Enabled: true
+      Head Length: 0.30000001192092896
+      Head Radius: 0.10000000149011612
+      Name: Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05000000074505806
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /gz/pose
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -176,25 +221,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 11.003799438476562
+      Distance: 6.411417007446289
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.06657352298498154
-        Y: 0.6042234301567078
-        Z: -0.6485766172409058
+        X: 0.05552547425031662
+        Y: 0.06113245338201523
+        Z: -0.11605660617351532
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.7104003429412842
+      Pitch: 0.6147971153259277
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.5786329507827759
+      Yaw: 1.6636333465576172
     Saved: ~
 Window Geometry:
   Displays:

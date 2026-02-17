@@ -147,22 +147,23 @@ ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.C
 " Enter
 
 # ============================================================
-# Pane 4 — DDS Pose Relay  (PX4 DDS → /px4/pose + TF)
+# Pane 4 — Gz Pose Relay  (Gazebo ground-truth → /px4/pose + TF)
 # ============================================================
-# Lightweight node that subscribes to PX4 native DDS topics
-# (vehicle_local_position + vehicle_attitude), converts
-# NED→ENU, and publishes PoseStamped + TF for RViz.
+# Subscribes to Gazebo dynamic_pose/info via gz-transport
+# (same mechanism as the gym env) and publishes PoseStamped
+# + TF for RViz.  No NED→ENU conversion needed — Gazebo
+# already uses ENU.
 # ============================================================
 tmux split-window -t "$SESSION" -v \; \
     send-keys "\
 ${PREAMBLE}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
 echo '──────────────────────────────────────────────────'
-echo '  📍  DDS Pose Relay  (use_sim_time:=true)'
+echo '  📍  Gz Pose Relay  (use_sim_time:=true)'
 echo '──────────────────────────────────────────────────'
-echo 'Waiting 5 s for PX4 & DDS to settle …'
+echo 'Waiting 5 s for Gazebo to settle …'
 sleep 5
-python3 /workspace/src/dds_pose_relay.py --ros-args -p use_sim_time:=true
+python3 /workspace/src/dds_pose_relay.py --ros-args -p use_sim_time:=true -p world_name:=${PX4_GZ_WORLD} -p model_name:=x500_mono_cam_0
 " Enter
 
 # ============================================================
