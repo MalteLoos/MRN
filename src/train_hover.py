@@ -122,11 +122,10 @@ class HoverEnvWrapper:
         self, action: torch.Tensor | np.ndarray
     ) -> Tuple[dict[str, Any], float, bool, dict]:
         # Map the 4-D model action (roll_rate, pitch_rate, yaw_rate, thrust)
-        # down to the env's 3-D action (roll, pitch, thrust).
-        # For the hover task the yaw_rate output is simply discarded.
+        # to the env's 4-D action (roll, pitch, yaw_rate, thrust).
         act_np = np.asarray(action, dtype=np.float32)
         env_action = np.array(
-            [act_np[0], act_np[1], act_np[3]],
+            [act_np[0], act_np[1], act_np[2], act_np[3]],
             dtype=np.float32,
         )
 
@@ -160,14 +159,14 @@ class HoverEnvWrapper:
         pos = obs["drone_pos"]  # ENU
         vel = obs["velocity"]
 
-        # altitude error
-        alt_err = abs(float(pos[2]) - self.hover_alt)
+        # altitude error (squared — RMS-style)
+        alt_err = (float(pos[2]) - self.hover_alt) ** 2
         # horizontal drift from origin
         horiz_drift = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
         # velocity penalty
         speed = float(np.linalg.norm(vel))
-        # action penalty
-        act_mag = float(np.sum(action**2))
+        # action penalty (exclude thrust)
+        act_mag = float(np.sum(action[:3] ** 2))
 
         reward = (
             -1.0 * alt_err
@@ -257,10 +256,10 @@ class DummyHoverEnv:
     def _reward(self, obs, action):
         pos = obs["drone_pos"]
         vel = obs["velocity"]
-        alt_err = abs(float(pos[2]) - self.hover_alt)
+        alt_err = (float(pos[2]) - self.hover_alt) ** 2
         horiz = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
         speed = float(np.linalg.norm(vel))
-        act_mag = float(np.sum(action**2))
+        act_mag = float(np.sum(action[:3] ** 2))
         return -1.0 * alt_err - 0.5 * horiz - 0.2 * speed - 0.05 * act_mag + 0.1
 
 

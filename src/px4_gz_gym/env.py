@@ -17,10 +17,11 @@ The environment spawns/connects to a **x500_mono_cam** drone.
     * ``velocity``    — ``(3,)``  float32  — ENU velocity
     * ``orientation`` — ``(4,)``  float32  — quaternion (w,x,y,z)
 
-* **Actions** — ``(3,)`` float32  ∈ [-1, 1]:
+* **Actions** — ``(4,)`` float32  ∈ [-1, 1]:
     * ``action[0]`` → roll  angle  (scaled to ± max_roll)
     * ``action[1]`` → pitch angle  (scaled to ± max_pitch)
-    * ``action[2]`` → thrust       (mapped to [0, 1])
+    * ``action[2]`` → yaw   rate   (scaled to ± max_yaw_rate)
+    * ``action[3]`` → thrust       (mapped to [0, 1])
 
   Sent to PX4 via ``VehicleAttitudeSetpoint`` over the DDS agent.
 
@@ -60,7 +61,8 @@ from px4_gz_gym import px4_cmd  # noqa: E402
 class PX4GazeboEnv(gym.Env):
     """
     Gymnasium env wrapping PX4-SITL + Gazebo Harmonic with deterministic
-    N-step physics advancing and attitude (roll / pitch / thrust) control.
+    N-step physics advancing and attitude (roll / pitch / yaw-rate / thrust)
+    control.
 
     Parameters
     ----------
@@ -100,6 +102,7 @@ class PX4GazeboEnv(gym.Env):
     # ── defaults ───────────────────────────────────────────
     DEFAULT_MAX_ROLL = math.radians(30.0)  # ± 30°
     DEFAULT_MAX_PITCH = math.radians(30.0)  # ± 30°
+    DEFAULT_MAX_YAW_RATE = math.radians(60.0)  # ± 60°/s
 
     def __init__(
         self,
@@ -110,6 +113,7 @@ class PX4GazeboEnv(gym.Env):
         step_size: float = 0.004,
         max_roll: float = DEFAULT_MAX_ROLL,
         max_pitch: float = DEFAULT_MAX_PITCH,
+        max_yaw_rate: float = DEFAULT_MAX_YAW_RATE,
         cam_obs_height: int = 128,
         cam_obs_width: int = 128,
         max_episode_steps: int = 2_000,
@@ -127,6 +131,7 @@ class PX4GazeboEnv(gym.Env):
         self.step_size = step_size
         self.max_roll = max_roll
         self.max_pitch = max_pitch
+        self.max_yaw_rate = max_yaw_rate
         self.cam_obs_height = cam_obs_height
         self.cam_obs_width = cam_obs_width
         self.max_episode_steps = max_episode_steps
@@ -148,11 +153,11 @@ class PX4GazeboEnv(gym.Env):
         # Sim-time delta per env.step()
         self.dt: float = n_gz_steps * step_size  # 5 × 0.004 = 0.02 s
 
-        # ── action space — 3-D: roll, pitch, thrust ────────
+        # ── action space — 4-D: roll, pitch, yaw_rate, thrust
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(3,),
+            shape=(4,),
             dtype=np.float32,
         )
 
@@ -280,8 +285,8 @@ class PX4GazeboEnv(gym.Env):
         action: np.ndarray,
     ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """
-        Apply *action* (roll, pitch, thrust), advance the sim by
-        ``n_gz_steps`` physics steps, and return the resulting
+        Apply *action* (roll, pitch, yaw_rate, thrust), advance the sim
+        by ``n_gz_steps`` physics steps, and return the resulting
         observation dict.
         """
         action = np.asarray(action, dtype=np.float32)
@@ -324,24 +329,26 @@ class PX4GazeboEnv(gym.Env):
     # ════════════════════════════════════════════════════════
 
     def _apply_action(self, action: np.ndarray) -> None:
-        """Map normalised ``[-1, 1]^3`` action to a PX4 attitude
+        """Map normalised ``[-1, 1]^4`` action to a PX4 attitude
         setpoint sent over the DDS agent.
 
         ::
 
             action[0]  →  roll   angle   ∈  [-max_roll,  +max_roll]
             action[1]  →  pitch  angle   ∈  [-max_pitch, +max_pitch]
-            action[2]  →  thrust         ∈  [0, 1]
+            action[2]  →  yaw    rate    ∈  [-max_yaw_rate, +max_yaw_rate]
+            action[3]  →  thrust         ∈  [0, 1]
 
-        The current yaw is read from the sensor cache and held constant
-        so the drone maintains its heading while the policy controls
-        roll / pitch / thrust.
+        The current yaw is read from the sensor cache.  The policy's
+        yaw-rate output is integrated over one env time-step (``dt``)
+        and added to the current heading to produce the yaw setpoint.
         """
         roll_cmd = float(action[0]) * self.max_roll
         pitch_cmd = float(action[1]) * self.max_pitch
-        thrust_cmd = float(np.clip((action[2] + 1.0) / 2.0, 0.0, 1.0))
+        yaw_rate_cmd = float(action[2]) * self.max_yaw_rate
+        thrust_cmd = float(np.clip((action[3] + 1.0) / 2.0, 0.0, 1.0))
 
-        # Hold current yaw from latest sensor reading
+        # Current yaw from latest sensor reading
         state = self._sensors.get_state_dict()
         q = state["orientation"]  # [w, x, y, z]
         current_yaw = math.atan2(
@@ -349,10 +356,13 @@ class PX4GazeboEnv(gym.Env):
             1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2),
         )
 
+        # Integrate yaw rate over one time-step
+        yaw_cmd = current_yaw + yaw_rate_cmd * self.dt
+
         px4_cmd.publish_attitude_command(
             roll=roll_cmd,
             pitch=pitch_cmd,
-            yaw=current_yaw,
+            yaw=yaw_cmd,
             thrust=thrust_cmd,
         )
 
