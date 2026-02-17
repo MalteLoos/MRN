@@ -245,13 +245,13 @@ class PX4GazeboEnv(gym.Env):
         self._gz.pause()
         _spawn_pos = (0.0, 0.0, 0.0)
         _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
-        for _ in range(10):
+        for _ in range(15):
             self._gz.set_model_pose(
                 self.model_name,
                 position=_spawn_pos,
                 orientation=_spawn_ori,
             )
-            _step(5)  # 5 × 10 = 50 total settle steps
+            _step(10)  # 5 × 10 = 50 total settle steps
 
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
         #    Sleeps inside are minimal (~20 ms for tmux delivery).
@@ -414,12 +414,24 @@ class PX4GazeboEnv(gym.Env):
         reward -= 0.01 * float(np.sum(action**2))
         return float(reward)
 
+    MAX_TILT_RAD: float = math.radians(45.0)
+
     def _is_terminated(self, obs: dict[str, np.ndarray]) -> bool:
-        """Default: terminate if below ground or way too high."""
+        """Default: terminate if below ground, way too high, or
+        tilted more than 60°."""
         z = float(obs["position"][2])
         if z < -0.5:
             return True
         if z > 100.0:
+            return True
+        # ── tilt check ──────────────────────────────────────
+        # Compute the angle between the body z-axis and world up
+        # from the orientation quaternion (w, x, y, z).
+        q = obs["orientation"]
+        # Body z-axis in world frame:  (2(xz + wy), 2(yz - wx), 1 - 2(x²+y²))
+        # cos(tilt) = dot(body_z, world_up) = 1 - 2(x² + y²)
+        cos_tilt = 1.0 - 2.0 * (float(q[1]) ** 2 + float(q[2]) ** 2)
+        if cos_tilt < math.cos(self.MAX_TILT_RAD):
             return True
         return False
 
