@@ -57,6 +57,12 @@ if [[ -f "${PATCH_DIR}/mono_cam_model.sdf" ]]; then
     echo "📎  Patched mono_cam model.sdf (256×256 @ 20 Hz)"
 fi
 
+if [[ -f "${PATCH_DIR}/tugbot_depot.sdf" ]]; then
+    sudo cp "${PATCH_DIR}/tugbot_depot.sdf" \
+        /opt/PX4-Autopilot/Tools/simulation/gz/worlds/tugbot_depot.sdf
+    echo "📎  Installed tugbot_depot world (PX4 lockstep + GPS)"
+fi
+
 # ── 7. Quick sanity checks ────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────"

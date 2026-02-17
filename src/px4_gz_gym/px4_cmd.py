@@ -124,7 +124,7 @@ class _PX4Cmd(Node):
         # Attitude setpoint  (roll / pitch / thrust)
         self._attitude_pub = self.create_publisher(
             VehicleAttitudeSetpoint,
-            "/fmu/in/vehicle_attitude_setpoint",
+            "/fmu/in/vehicle_attitude_setpoint_v1",
             10,
         )
 
@@ -605,3 +605,49 @@ def land_and_disarm(timeout: float = 15.0) -> bool:
     node.disarm(force=True)
     time.sleep(0.5)
     return not node.armed
+
+
+# ════════════════════════════════════════════════════════════
+#  PX4 NSH console commands  (via tmux)
+# ════════════════════════════════════════════════════════════
+
+
+def nsh_command(
+    cmd: str,
+    tmux_target: str = "px4sim:sim.1",
+) -> None:
+    """Send an NSH shell command to the PX4 SITL console.
+
+    PX4 SITL runs inside a tmux pane.  This function uses
+    ``tmux send-keys`` to inject a command into that pane's
+    NuttShell (nsh) prompt.
+
+    Parameters
+    ----------
+    cmd : str
+        The NSH command to run (e.g. ``"ekf2 stop"``).
+    tmux_target : str
+        tmux target pane (``session:window.pane``).
+    """
+    import subprocess as _sp
+    _sp.run(
+        ["tmux", "send-keys", "-t", tmux_target, cmd, "Enter"],
+        check=False,
+        capture_output=True,
+    )
+
+
+def restart_ekf2(
+    tmux_target: str = "px4sim:sim.1",
+    settle_time: float = 0.5,
+) -> None:
+    """Stop and restart EKF2 so all filter state is wiped.
+
+    Call this during ``env.reset()`` after teleporting the drone
+    so the estimator starts fresh with no stale covariance,
+    innovation history, or fault flags from the previous episode.
+    """
+    nsh_command("ekf2 stop", tmux_target=tmux_target)
+    time.sleep(settle_time)
+    nsh_command("ekf2 start", tmux_target=tmux_target)
+    time.sleep(settle_time)

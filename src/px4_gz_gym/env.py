@@ -110,8 +110,8 @@ class PX4GazeboEnv(gym.Env):
         step_size: float = 0.004,
         max_roll: float = DEFAULT_MAX_ROLL,
         max_pitch: float = DEFAULT_MAX_PITCH,
-        cam_obs_height: int = 64,
-        cam_obs_width: int = 64,
+        cam_obs_height: int = 128,
+        cam_obs_width: int = 128,
         max_episode_steps: int = 2_000,
         takeoff_alt: float = 2.5,
         enable_rviz: bool = True,
@@ -233,6 +233,11 @@ class PX4GazeboEnv(gym.Env):
         )
         self._gz.step_and_wait(50, step_size=self.step_size)
 
+        # ── 3b. Restart EKF2 so all filter state is wiped ──
+        #    ekf2 stop → start clears covariance, innovation
+        #    history, and fault flags from the previous episode.
+        px4_cmd.restart_ekf2()
+
         # ── 4. Clear sensor buffers for fresh episode ───────
         self._sensors.clear_imu_buffer()
         self._sensors.clear_trajectory()
@@ -281,13 +286,10 @@ class PX4GazeboEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
 
         # 1. Apply action → PX4 attitude setpoint ───────────
+        #    publish_attitude_command() already sends both the
+        #    OffboardControlMode heartbeat AND the attitude setpoint,
+        #    so no separate heartbeat is needed here.
         self._apply_action(action)
-
-        # 1b. Offboard heartbeat (attitude mode) — keeps PX4
-        #     in OFFBOARD even if setpoint is slightly delayed.
-        px4_cmd.publish_offboard_attitude_heartbeat(
-            thrust=0.5,
-        )
 
         # 2. Step Gazebo ─────────────────────────────────────
         sim_time = self._gz.step_and_wait(

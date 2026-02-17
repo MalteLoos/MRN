@@ -1,8 +1,19 @@
 """
-Drone Waypoint Navigation - Reinforcement Learning Model
+Drone Waypoint Navigation - Reinforcement Learning Model  (dual-rate)
 
-A PPO-based actor-critic model for drone navigation through sequential waypoints.
-Inputs:  IMU (linear accel + angular vel), Camera image, 2 look-ahead waypoints.
+A PPO-based actor-critic model for drone navigation through sequential
+waypoints, split into two update rates:
+
+**Slow path** (camera rate, ~30 Hz):
+    A pretrained RAFT-Small optical-flow backbone (frozen) computes dense flow
+    between consecutive camera frames.  A small trainable CNN compresses the
+    flow map into a compact visual-feature vector that is *cached*.
+
+**Fast path** (IMU rate, ~250 Hz):
+    A lightweight MLP ingests the latest IMU sample, the two body-frame
+    look-ahead waypoints, **and** the cached visual features.  Its output
+    feeds actor + critic heads that produce body-rate commands.
+
 Outputs: Body-rate commands (roll_rate, pitch_rate, yaw_rate, thrust).
 
 The drone always keeps two upcoming waypoints in its buffer. When it enters the
@@ -24,40 +35,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ModelConfig:
     """All tuneable hyper-parameters live here."""
 
     # --- Camera input ---------------------------------------------------------
-    cam_channels: int = 3           # RGB
-    cam_height: int = 64
-    cam_width: int = 64
-    cam_feature_dim: int = 128      # CNN output size
+    cam_channels: int = 3  # RGB
+    cam_height: int = 128  # RAFT-Small needs ≥ 128
+    cam_width: int = 128
+
+    # --- Optical-flow / slow path --------------------------------------------
+    flow_feature_dim: int = 64  # compressed flow-vector size
+    raft_iters: int = 6  # RAFT refinement iterations at inference
 
     # --- IMU input ------------------------------------------------------------
-    imu_dim: int = 6                # 3 accel + 3 gyro
+    imu_dim: int = 6  # 3 accel + 3 gyro
 
     # --- Waypoint input -------------------------------------------------------
-    waypoint_dim: int = 3           # (x, y, z) per waypoint — in body frame
-    num_waypoints: int = 2          # always 2 look-ahead waypoints
+    waypoint_dim: int = 3  # (x, y, z) per waypoint — in body frame
+    num_waypoints: int = 2  # always 2 look-ahead waypoints
 
-    # --- Fusion / shared backbone ---------------------------------------------
-    fusion_hidden: int = 256
-    fusion_layers: int = 2
+    # --- Fast-path backbone ---------------------------------------------------
+    fast_hidden: int = 128  # hidden size of the fast MLP
+    fast_layers: int = 2
 
     # --- Actor (policy) -------------------------------------------------------
-    action_dim: int = 4             # roll_rate, pitch_rate, yaw_rate, thrust
+    action_dim: int = 4  # roll_rate, pitch_rate, yaw_rate, thrust
     log_std_min: float = -5.0
     log_std_max: float = 0.5
 
     # --- Waypoint management --------------------------------------------------
-    safety_radius: float = 1.0     # metres — when within this, waypoint reached
+    safety_radius: float = 1.0  # metres — when within this, waypoint reached
 
     # --- Training defaults ----------------------------------------------------
     gamma: float = 0.99
@@ -70,16 +86,20 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# Camera encoder (lightweight CNN)
+# Slow path — optical-flow visual encoder  (runs at camera rate)
 # ---------------------------------------------------------------------------
 
-class CameraEncoder(nn.Module):
-    """Encodes an RGB image into a compact feature vector."""
+
+class FlowEncoder(nn.Module):
+    """
+    Small trainable CNN that compresses a dense optical-flow map (2, H, W)
+    into a compact feature vector of size ``flow_feature_dim``.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(cfg.cam_channels, 32, 5, stride=2, padding=2),
+            nn.Conv2d(2, 32, 5, stride=2, padding=2),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
             nn.ReLU(inplace=True),
@@ -89,96 +109,137 @@ class CameraEncoder(nn.Module):
         )
         # 64 * 4 * 4 = 1024
         self.fc = nn.Sequential(
-            nn.Linear(64 * 4 * 4, cfg.cam_feature_dim),
+            nn.Linear(64 * 4 * 4, cfg.flow_feature_dim),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, img: torch.Tensor) -> torch.Tensor:
+    def forward(self, flow: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            img: (B, C, H, W) normalised image in [0, 1].
+            flow: (B, 2, H, W) dense optical-flow map.
         Returns:
-            features: (B, cam_feature_dim)
+            features: (B, flow_feature_dim)
         """
-        x = self.conv(img)
+        x = self.conv(flow)
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
 
-# ---------------------------------------------------------------------------
-# State encoder  (IMU + waypoints)
-# ---------------------------------------------------------------------------
+class SlowVisualEncoder(nn.Module):
+    """
+    Wraps a **frozen** RAFT-Small backbone and a trainable ``FlowEncoder``.
 
-class StateEncoder(nn.Module):
-    """Encodes IMU readings and the two upcoming waypoints."""
+    Call ``forward(img_prev, img_curr)`` whenever a new camera frame arrives.
+    The resulting feature vector should be cached and reused by the fast path
+    until the next camera frame.
+
+    RAFT-Small weights are loaded from the official torchvision checkpoint and
+    are **not** updated during PPO training.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        input_dim = cfg.imu_dim + cfg.waypoint_dim * cfg.num_waypoints
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
-            nn.ReLU(inplace=True),
-        )
-        self.output_dim = 64
+        self.cfg = cfg
+
+        # ----- frozen RAFT-Small backbone ------------------------------------
+        self.raft = raft_small(weights=Raft_Small_Weights.DEFAULT)
+        for p in self.raft.parameters():
+            p.requires_grad = False
+        self.raft.eval()
+
+        # ----- trainable flow encoder ----------------------------------------
+        self.flow_encoder = FlowEncoder(cfg)
+
+    @property
+    def output_dim(self) -> int:
+        return self.cfg.flow_feature_dim
+
+    def forward(
+        self,
+        img_prev: torch.Tensor,
+        img_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute optical-flow features from two consecutive RGB frames.
+
+        Args:
+            img_prev: (B, 3, H, W)  previous frame, float32 in [0, 1].
+            img_curr: (B, 3, H, W)  current  frame, float32 in [0, 1].
+
+        Returns:
+            vis_feat: (B, flow_feature_dim) — compact visual feature vector.
+        """
+        # RAFT expects pixel values in [0, 255]
+        prev_255 = img_prev * 255.0
+        curr_255 = img_curr * 255.0
+
+        with torch.no_grad():
+            # Run RAFT under fp16 autocast — required on Blackwell GPUs
+            # (SM 12.0) where float32 cuBLAS is broken (CUBLAS_STATUS_NOT_INITIALIZED).
+            # autocast is a no-op on CPU, so this is safe everywhere.
+            with torch.amp.autocast(  # type: ignore[attr-defined]
+                device_type=prev_255.device.type, dtype=torch.float16
+            ):
+                # raft returns a list of flow predictions; last is most refined
+                flow_preds = self.raft(
+                    prev_255,
+                    curr_255,
+                    num_flow_updates=self.cfg.raft_iters,
+                )
+            flow = flow_preds[-1].float()  # (B, 2, H, W) — back to fp32
+
+        # trainable compression
+        return self.flow_encoder(flow)
+
+
+# ---------------------------------------------------------------------------
+# Fast path — state encoder  (runs at IMU rate)
+# ---------------------------------------------------------------------------
+
+
+class FastStateEncoder(nn.Module):
+    """
+    Lightweight MLP that fuses IMU, look-ahead waypoints, **and** the
+    cached visual feature on every IMU tick.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        state_dim = cfg.imu_dim + cfg.waypoint_dim * cfg.num_waypoints
+        in_dim = state_dim + cfg.flow_feature_dim
+
+        layers: list[nn.Module] = []
+        for i in range(cfg.fast_layers):
+            layers.append(
+                nn.Linear(in_dim if i == 0 else cfg.fast_hidden, cfg.fast_hidden)
+            )
+            layers.append(nn.ReLU(inplace=True))
+        self.net = nn.Sequential(*layers)
+        self.output_dim = cfg.fast_hidden
 
     def forward(
         self,
         imu: torch.Tensor,
         waypoints: torch.Tensor,
+        vis_feat: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            imu:       (B, imu_dim)          — [ax, ay, az, gx, gy, gz]
-            waypoints: (B, num_wp * wp_dim)  — flattened [wp1_x, wp1_y, wp1_z,
-                                                          wp2_x, wp2_y, wp2_z]
+            imu:       (B, imu_dim)           — [ax, ay, az, gx, gy, gz]
+            waypoints: (B, num_wp * wp_dim)   — flattened body-frame waypoints
+            vis_feat:  (B, flow_feature_dim)  — cached slow-path output
+
         Returns:
-            features: (B, 64)
+            features: (B, fast_hidden)
         """
-        x = torch.cat([imu, waypoints], dim=-1)
+        x = torch.cat([imu, waypoints, vis_feat], dim=-1)
         return self.net(x)
-
-
-# ---------------------------------------------------------------------------
-# Multi-modal fusion backbone
-# ---------------------------------------------------------------------------
-
-class FusionBackbone(nn.Module):
-    """Merges camera features and state features into a shared representation."""
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        cam_feat = cfg.cam_feature_dim  # 128
-        state_feat = 64                 # from StateEncoder
-        in_dim = cam_feat + state_feat
-
-        layers: list[nn.Module] = []
-        for i in range(cfg.fusion_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else cfg.fusion_hidden,
-                                    cfg.fusion_hidden))
-            layers.append(nn.ReLU(inplace=True))
-        self.net = nn.Sequential(*layers)
-        self.output_dim = cfg.fusion_hidden
-
-    def forward(
-        self,
-        cam_feat: torch.Tensor,
-        state_feat: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            cam_feat:   (B, cam_feature_dim)
-            state_feat: (B, 64)
-        Returns:
-            fused: (B, fusion_hidden)
-        """
-        return self.net(torch.cat([cam_feat, state_feat], dim=-1))
 
 
 # ---------------------------------------------------------------------------
 # Actor head  — outputs body-rate commands
 # ---------------------------------------------------------------------------
+
 
 class ActorHead(nn.Module):
     """
@@ -192,10 +253,10 @@ class ActorHead(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.mu = nn.Sequential(
-            nn.Linear(cfg.fusion_hidden, 64),
+            nn.Linear(cfg.fast_hidden, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, cfg.action_dim),
-            nn.Tanh(),                           # bound means to [-1, 1]
+            nn.Tanh(),  # bound means to [-1, 1]
         )
         # Learnable log-std (state-independent)
         self.log_std = nn.Parameter(torch.zeros(cfg.action_dim))
@@ -210,8 +271,9 @@ class ActorHead(nn.Module):
             log_std: (B, action_dim) — clamped
         """
         mu = self.mu(fused)
-        log_std = self.log_std.clamp(self.cfg.log_std_min,
-                                     self.cfg.log_std_max).expand_as(mu)
+        log_std = self.log_std.clamp(
+            self.cfg.log_std_min, self.cfg.log_std_max
+        ).expand_as(mu)
         return mu, log_std
 
     def sample(
@@ -245,11 +307,12 @@ class ActorHead(nn.Module):
 # Critic head  — estimates state value V(s)
 # ---------------------------------------------------------------------------
 
+
 class CriticHead(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.fusion_hidden, 64),
+            nn.Linear(cfg.fast_hidden, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
         )
@@ -260,37 +323,108 @@ class CriticHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full actor-critic policy
+# Full actor-critic policy  (dual-rate)
 # ---------------------------------------------------------------------------
+
 
 class DronePolicy(nn.Module):
     """
-    End-to-end actor-critic policy for waypoint-following drone control.
+    Dual-rate actor-critic policy for waypoint-following drone control.
+
+    Architecture
+    ────────────
+    **Slow path** — updated when a new camera frame arrives:
+        ``SlowVisualEncoder``  (frozen RAFT-Small → trainable FlowEncoder)
+        Produces a visual-feature vector that is cached internally.
+
+    **Fast path** — updated on every IMU tick:
+        ``FastStateEncoder``  (IMU + waypoints + cached visual feature)
+        → ``ActorHead``  (body-rate Gaussian policy)
+        → ``CriticHead``  (V(s))
 
     Observation dict expected keys
     ──────────────────────────────
-    - ``"cam"``       : (B, C, H, W) float32 image in [0, 1]
-    - ``"imu"``       : (B, 6) float32  [ax, ay, az, gx, gy, gz]
-    - ``"waypoints"`` : (B, 6) float32  [wp1_xyz, wp2_xyz]  — body frame
+    For ``update_vision()`` (camera rate):
+        - ``"cam_prev"``  : (B, C, H, W) float32 image in [0, 1]
+        - ``"cam_curr"``  : (B, C, H, W) float32 image in [0, 1]
+
+    For ``act()`` / ``evaluate_actions()`` (IMU rate):
+        - ``"imu"``       : (B, 6) float32  [ax, ay, az, gx, gy, gz]
+        - ``"waypoints"`` : (B, 6) float32  [wp1_xyz, wp2_xyz]  — body frame
+        - ``"vis_feat"``  : (B, flow_feature_dim) — *optional* at inference;
+                            if omitted the internally cached features are used.
     """
 
     def __init__(self, cfg: ModelConfig | None = None):
         super().__init__()
         self.cfg = cfg or ModelConfig()
-        self.cam_encoder = CameraEncoder(self.cfg)
-        self.state_encoder = StateEncoder(self.cfg)
-        self.backbone = FusionBackbone(self.cfg)
+
+        # Slow path (camera rate)
+        self.slow_visual = SlowVisualEncoder(self.cfg)
+
+        # Fast path (IMU rate)
+        self.fast_encoder = FastStateEncoder(self.cfg)
         self.actor = ActorHead(self.cfg)
         self.critic = CriticHead(self.cfg)
 
-    # ----- helpers --------------------------------------------------------
+        # Cached visual features — filled by update_vision(), consumed by act()
+        self._vis_feat_cache: torch.Tensor | None = None
 
-    def _encode(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        cam_feat = self.cam_encoder(obs["cam"])
-        state_feat = self.state_encoder(obs["imu"], obs["waypoints"])
-        return self.backbone(cam_feat, state_feat)
+    def train(self, mode: bool = True):
+        """Override: keep RAFT frozen in eval() mode at all times."""
+        super().train(mode)
+        self.slow_visual.raft.eval()
+        return self
 
-    # ----- public API -----------------------------------------------------
+    # ----- slow path (call at camera rate) --------------------------------
+
+    def update_vision(
+        self,
+        img_prev: torch.Tensor,
+        img_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run the slow visual encoder and cache the result.
+
+        Should be called once per camera frame.  Between camera frames the
+        fast path reuses the cached feature vector.
+
+        Args:
+            img_prev: (B, C, H, W) float32 in [0, 1]
+            img_curr: (B, C, H, W) float32 in [0, 1]
+
+        Returns:
+            vis_feat: (B, flow_feature_dim) — also stored in internal cache.
+        """
+        vis_feat = self.slow_visual(img_prev, img_curr)
+        self._vis_feat_cache = vis_feat.detach()
+        return vis_feat
+
+    # ----- fast path helpers ----------------------------------------------
+
+    def _get_vis_feat(
+        self,
+        obs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Return visual features from *obs* dict if provided, otherwise fall
+        back to the internal cache.
+        """
+        if "vis_feat" in obs:
+            return obs["vis_feat"]
+        if self._vis_feat_cache is not None:
+            return self._vis_feat_cache
+        # No vision yet — return zeros (e.g. first tick before first frame)
+        B = obs["imu"].size(0)
+        device = obs["imu"].device
+        return torch.zeros(B, self.cfg.flow_feature_dim, device=device)
+
+    def _encode_fast(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run the fast-path encoder (IMU + waypoints + cached vis)."""
+        vis_feat = self._get_vis_feat(obs)
+        return self.fast_encoder(obs["imu"], obs["waypoints"], vis_feat)
+
+    # ----- public API (fast path — call at IMU rate) ----------------------
 
     @torch.no_grad()
     def act(
@@ -301,18 +435,28 @@ class DronePolicy(nn.Module):
         """
         Collect a single transition (inference mode).
 
+        This is the **fast path** — call at IMU rate.  Make sure
+        ``update_vision()`` has been called at least once with the latest
+        camera frame pair before the first call.
+
         Returns:
-            action   : (B, 4) body-rate command
-            log_prob : (B,)   log π(a|s)
-            value    : (B, 1) V(s)
+            action   : (B, 4) body-rate command  (fp32)
+            log_prob : (B,)   log π(a|s)         (fp32)
+            value    : (B, 1) V(s)               (fp32)
         """
-        fused = self._encode(obs)
-        value = self.critic(fused)
-        if deterministic:
-            mu, _ = self.actor(fused)
-            return mu, torch.zeros(mu.size(0), device=mu.device), value
-        action, log_prob = self.actor.sample(fused)
-        return action, log_prob, value
+        dev = obs["imu"].device
+        with torch.amp.autocast(  # type: ignore[attr-defined]
+            device_type=dev.type,
+            dtype=torch.float16,
+            enabled=(dev.type == "cuda"),
+        ):
+            fused = self._encode_fast(obs)
+            value = self.critic(fused)
+            if deterministic:
+                mu, _ = self.actor(fused)
+                return mu.float(), torch.zeros(mu.size(0), device=dev), value.float()
+            action, log_prob = self.actor.sample(fused)
+        return action.float(), log_prob.float(), value.float()
 
     def evaluate_actions(
         self,
@@ -322,20 +466,29 @@ class DronePolicy(nn.Module):
         """
         Re-evaluate stored transitions during PPO update.
 
+        ``obs["vis_feat"]`` **must** be provided (stored from rollout).
+
         Returns:
-            log_prob : (B,)
-            entropy  : (B,)
-            value    : (B, 1)
+            log_prob : (B,)    (fp32)
+            entropy  : (B,)    (fp32)
+            value    : (B, 1)  (fp32)
         """
-        fused = self._encode(obs)
-        log_prob, entropy = self.actor.evaluate(fused, actions)
-        value = self.critic(fused)
-        return log_prob, entropy, value
+        dev = obs["imu"].device
+        with torch.amp.autocast(  # type: ignore[attr-defined]
+            device_type=dev.type,
+            dtype=torch.float16,
+            enabled=(dev.type == "cuda"),
+        ):
+            fused = self._encode_fast(obs)
+            log_prob, entropy = self.actor.evaluate(fused, actions)
+            value = self.critic(fused)
+        return log_prob.float(), entropy.float(), value.float()
 
 
 # ---------------------------------------------------------------------------
 # Waypoint buffer manager
 # ---------------------------------------------------------------------------
+
 
 class WaypointBuffer:
     """
@@ -372,8 +525,7 @@ class WaypointBuffer:
     # ----- internal -------------------------------------------------------
 
     @staticmethod
-    def _dist(a: Tuple[float, float, float],
-              b: Tuple[float, float, float]) -> float:
+    def _dist(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
         return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b)))
 
     def _advance(self) -> None:
@@ -406,20 +558,68 @@ class WaypointBuffer:
             self._advance()
         return self.wp0, self.wp1
 
+    @staticmethod
+    def _quat_rotate_inverse(
+        q: Tuple[float, float, float, float],
+        v: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        """
+        Rotate vector *v* by the inverse of quaternion *q* (w, x, y, z).
+
+        Equivalent to transforming a world-frame vector into the body
+        frame described by *q*.
+        """
+        w, x, y, z = q
+        # q_inv for unit quaternion = conjugate
+        # v' = q* ⊗ v ⊗ q
+        # Expanded form (avoids allocating intermediate quats):
+        vx, vy, vz = v
+        # t = 2 * cross(q_xyz, v)
+        tx = 2.0 * (y * vz - z * vy)
+        ty = 2.0 * (z * vx - x * vz)
+        tz = 2.0 * (x * vy - y * vx)
+        # Using conjugate: negate q_xyz → negate t
+        tx, ty, tz = -tx, -ty, -tz
+        # result = v + w*t + cross((-q_xyz), t)
+        rx = vx + w * tx + (-y * tz - (-z) * ty)
+        ry = vy + w * ty + (-z * tx - (-x) * tz)
+        rz = vz + w * tz + (-x * ty - (-y) * tx)
+        return (rx, ry, rz)
+
     def current_targets_tensor(
         self,
         drone_pos: Tuple[float, float, float],
+        drone_quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
         device: torch.device | str = "cpu",
     ) -> torch.Tensor:
         """
-        Returns the two waypoints as a flat (1, 6) tensor ready for the
-        policy, after calling ``update``.
+        Returns the two waypoints as a flat (1, 6) tensor in the **body
+        frame** of the drone, ready for the policy.
 
-        The waypoints are returned in *world frame*.  If you need body-frame
-        coordinates, transform them before feeding to the policy.
+        Steps:
+        1. ``update(drone_pos)`` — advance / check safety radius.
+        2. Subtract ``drone_pos`` → relative world-frame offsets.
+        3. Rotate by inverse of ``drone_quat`` → body-frame offsets.
+
+        Args:
+            drone_pos:  (x, y, z) world-frame position.
+            drone_quat: (w, x, y, z) world-frame orientation quaternion.
+            device:     torch device for the output tensor.
+
+        Returns:
+            (1, 6) tensor — [wp0_body_xyz, wp1_body_xyz].
         """
         wp0, wp1 = self.update(drone_pos)
-        data = [*wp0, *wp1]
+
+        # world-frame offset
+        off0 = (wp0[0] - drone_pos[0], wp0[1] - drone_pos[1], wp0[2] - drone_pos[2])
+        off1 = (wp1[0] - drone_pos[0], wp1[1] - drone_pos[1], wp1[2] - drone_pos[2])
+
+        # rotate into body frame
+        b0 = self._quat_rotate_inverse(drone_quat, off0)
+        b1 = self._quat_rotate_inverse(drone_quat, off1)
+
+        data = [*b0, *b1]
         return torch.tensor([data], dtype=torch.float32, device=device)
 
     @property
@@ -432,9 +632,20 @@ class WaypointBuffer:
 # High-level agent wrapper  (optional convenience)
 # ---------------------------------------------------------------------------
 
+
 class DroneAgent:
     """
-    Ties the policy and waypoint buffer together for rollout collection.
+    Ties the dual-rate policy and waypoint buffer together for rollout
+    collection.
+
+    The agent exposes two call paths that mirror the policy's split:
+
+    - ``update_vision(obs)`` — call whenever a **new camera frame** arrives.
+      Runs the slow visual encoder (RAFT-Small → FlowEncoder) and caches
+      the resulting feature vector inside the policy.
+
+    - ``step(obs)`` — call on **every IMU tick**.  Uses cached visual
+      features + fresh IMU / waypoint data to produce a body-rate command.
 
     Usage
     -----
@@ -442,6 +653,8 @@ class DroneAgent:
     >>> agent = DroneAgent(cfg, route=[(0,0,5), (10,0,5), (10,10,5), (0,10,5)])
     >>> obs = env.reset()
     >>> while not done:
+    ...     if obs.get("new_frame", False):
+    ...         agent.update_vision(obs)
     ...     action = agent.step(obs)
     ...     obs, reward, done, info = env.step(action)
     """
@@ -456,6 +669,10 @@ class DroneAgent:
         self.device = torch.device(device)
         self.policy = DronePolicy(self.cfg).to(self.device)
         self._buffer: Optional[WaypointBuffer] = None
+
+        # Previous frame for optical-flow computation
+        self._prev_frame: Optional[torch.Tensor] = None
+
         if route is not None:
             self.set_route(route)
 
@@ -465,7 +682,55 @@ class DroneAgent:
         """(Re-)initialise the waypoint buffer with a new route."""
         self._buffer = WaypointBuffer(route, self.cfg.safety_radius)
 
-    # ----- step -----------------------------------------------------------
+    def reset_vision(self) -> None:
+        """Clear cached visual state (call on episode reset)."""
+        self._prev_frame = None
+        self.policy._vis_feat_cache = None
+
+    # ----- image helpers --------------------------------------------------
+
+    @staticmethod
+    def _prepare_image(
+        raw: torch.Tensor | object,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Normalise a raw image to (1, C, H, W) float32 in [0, 1]."""
+        if not isinstance(raw, torch.Tensor):
+            raw = torch.as_tensor(raw, dtype=torch.float32)
+        if raw.ndim == 3 and raw.shape[-1] in (1, 3):
+            raw = raw.permute(2, 0, 1)  # HWC → CHW
+        if raw.ndim == 3:
+            raw = raw.unsqueeze(0)  # add batch dim
+        if raw.max() > 1.0:
+            raw = raw / 255.0
+        return raw.to(device)
+
+    # ----- slow path (camera rate) ----------------------------------------
+
+    @torch.no_grad()
+    def update_vision(self, obs: dict) -> torch.Tensor | None:
+        """
+        Run the slow visual encoder on the latest camera frame.
+
+        ``obs`` must contain ``"cam"`` (current frame).  The agent keeps
+        the previous frame internally.  On the very first call (no prior
+        frame), the previous frame is set equal to the current one (zero
+        flow).
+
+        Returns:
+            vis_feat: (1, flow_feature_dim) or ``None`` if skipped.
+        """
+        cam_curr = self._prepare_image(obs["cam"], self.device)
+
+        if self._prev_frame is None:
+            # First frame → duplicate (zero flow baseline)
+            self._prev_frame = cam_curr.clone()
+
+        vis_feat = self.policy.update_vision(self._prev_frame, cam_curr)
+        self._prev_frame = cam_curr
+        return vis_feat
+
+    # ----- fast path (IMU rate) -------------------------------------------
 
     def step(
         self,
@@ -473,30 +738,20 @@ class DroneAgent:
         deterministic: bool = False,
     ) -> torch.Tensor:
         """
-        Perform one decision step.
+        Perform one decision step at **IMU rate**.
 
         ``obs`` must contain:
 
-        - ``"cam"``       : (H, W, C) or (B, C, H, W) uint8/float image
         - ``"imu"``       : (6,) or (B, 6) float
         - ``"drone_pos"`` : (3,) float — used to update the waypoint buffer
+
+        ``"cam"`` is **not** required here; vision is updated separately
+        via ``update_vision()``.
 
         Returns:
             action: (4,) numpy-compatible body-rate command
         """
         assert self._buffer is not None, "Call set_route() before step()."
-
-        # --- prepare camera --------------------------------------------------
-        cam = obs["cam"]
-        if not isinstance(cam, torch.Tensor):
-            cam = torch.as_tensor(cam, dtype=torch.float32)
-        if cam.ndim == 3 and cam.shape[-1] in (1, 3):
-            cam = cam.permute(2, 0, 1)         # HWC → CHW
-        if cam.ndim == 3:
-            cam = cam.unsqueeze(0)              # add batch dim
-        if cam.max() > 1.0:
-            cam = cam / 255.0
-        cam = cam.to(self.device)
 
         # --- prepare IMU -----------------------------------------------------
         imu = obs["imu"]
@@ -507,15 +762,24 @@ class DroneAgent:
         imu = imu.to(self.device)
 
         # --- update waypoint buffer & build tensor ---------------------------
-        drone_pos = tuple(float(x) for x in obs["drone_pos"][:3])
+        dp = [float(x) for x in obs["drone_pos"][:3]]
+        drone_pos: Tuple[float, float, float] = (dp[0], dp[1], dp[2])
+
+        # orientation (w, x, y, z) — needed for world→body transform
+        dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+        drone_quat: Tuple[float, float, float, float] = (dq[0], dq[1], dq[2], dq[3])
+
         wp_tensor = self._buffer.current_targets_tensor(
-            drone_pos, device=self.device,
+            drone_pos,
+            drone_quat=drone_quat,
+            device=self.device,
         )
 
-        # --- forward pass ----------------------------------------------------
-        policy_obs = {"cam": cam, "imu": imu, "waypoints": wp_tensor}
+        # --- forward pass (fast path only) -----------------------------------
+        policy_obs = {"imu": imu, "waypoints": wp_tensor}
         action, log_prob, value = self.policy.act(
-            policy_obs, deterministic=deterministic,
+            policy_obs,
+            deterministic=deterministic,
         )
         return action.squeeze(0).cpu()
 
@@ -547,9 +811,19 @@ class DroneAgent:
 # Rollout buffer  (PPO experience storage + GAE)
 # ---------------------------------------------------------------------------
 
+
 class RolloutBuffer:
     """
     Stores one epoch of on-policy transitions and computes GAE advantages.
+
+    Dual-rate design
+    ────────────────
+    Every stored transition corresponds to one **IMU tick** (fast path).
+    Camera / optical-flow features are computed at the slower camera rate
+    and the resulting ``vis_feat`` vector is stored alongside each transition
+    (it stays constant between camera frames).  During PPO updates the
+    policy's fast path is re-evaluated using the stored ``vis_feat``, so we
+    never need to re-run RAFT — this keeps the update cheap.
 
     Replay buffers vs rollout buffers
     ──────────────────────────────────
@@ -578,9 +852,9 @@ class RolloutBuffer:
     def __init__(
         self,
         buffer_size: int,
-        cam_shape: Tuple[int, int, int],
         imu_dim: int,
         wp_dim: int,
+        vis_feat_dim: int,
         action_dim: int,
         device: str = "cpu",
         gamma: float = 0.99,
@@ -588,14 +862,14 @@ class RolloutBuffer:
     ):
         """
         Args:
-            buffer_size: Number of transitions to collect per rollout epoch.
-            cam_shape:   (C, H, W) of the camera observation.
-            imu_dim:     Dimensionality of the IMU vector (default 6).
-            wp_dim:      Dimensionality of the flattened waypoint vector (default 6).
-            action_dim:  Dimensionality of the action (default 4).
-            device:      "cpu" or "cuda".
-            gamma:       Discount factor.
-            gae_lambda:  GAE λ for bias–variance trade-off.
+            buffer_size:  Number of transitions to collect per rollout epoch.
+            imu_dim:      Dimensionality of the IMU vector (default 6).
+            wp_dim:       Dimensionality of the flattened waypoint vector (default 6).
+            vis_feat_dim: Dimensionality of the cached visual feature vector.
+            action_dim:   Dimensionality of the action (default 4).
+            device:       "cpu" or "cuda".
+            gamma:        Discount factor.
+            gae_lambda:   GAE λ for bias–variance trade-off.
         """
         self.buffer_size = buffer_size
         self.device = torch.device(device)
@@ -603,18 +877,18 @@ class RolloutBuffer:
         self.gae_lambda = gae_lambda
 
         # ----- pre-allocate storage ------------------------------------------
-        self.cam       = torch.zeros(buffer_size, *cam_shape, device=self.device)
-        self.imu       = torch.zeros(buffer_size, imu_dim,    device=self.device)
-        self.waypoints = torch.zeros(buffer_size, wp_dim,     device=self.device)
-        self.actions   = torch.zeros(buffer_size, action_dim, device=self.device)
-        self.log_probs = torch.zeros(buffer_size,             device=self.device)
-        self.rewards   = torch.zeros(buffer_size,             device=self.device)
-        self.values    = torch.zeros(buffer_size,             device=self.device)
-        self.dones     = torch.zeros(buffer_size,             device=self.device)
+        self.imu = torch.zeros(buffer_size, imu_dim, device=self.device)
+        self.waypoints = torch.zeros(buffer_size, wp_dim, device=self.device)
+        self.vis_feat = torch.zeros(buffer_size, vis_feat_dim, device=self.device)
+        self.actions = torch.zeros(buffer_size, action_dim, device=self.device)
+        self.log_probs = torch.zeros(buffer_size, device=self.device)
+        self.rewards = torch.zeros(buffer_size, device=self.device)
+        self.values = torch.zeros(buffer_size, device=self.device)
+        self.dones = torch.zeros(buffer_size, device=self.device)
 
         # ----- computed after finish() ---------------------------------------
         self.advantages = torch.zeros(buffer_size, device=self.device)
-        self.returns    = torch.zeros(buffer_size, device=self.device)
+        self.returns = torch.zeros(buffer_size, device=self.device)
 
         self.ptr = 0
         self.full = False
@@ -628,9 +902,9 @@ class RolloutBuffer:
 
     def store(
         self,
-        cam: torch.Tensor,
         imu: torch.Tensor,
         waypoints: torch.Tensor,
+        vis_feat: torch.Tensor,
         action: torch.Tensor,
         log_prob: torch.Tensor,
         reward: float,
@@ -641,19 +915,19 @@ class RolloutBuffer:
         Append a single transition.
 
         All tensor inputs should already be on ``self.device`` and have no
-        batch dimension (i.e. squeezed to 1-D / 3-D for cam).
+        batch dimension.
         """
         assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
 
         i = self.ptr
-        self.cam[i]       = cam
-        self.imu[i]       = imu
+        self.imu[i] = imu
         self.waypoints[i] = waypoints
-        self.actions[i]   = action
+        self.vis_feat[i] = vis_feat
+        self.actions[i] = action
         self.log_probs[i] = log_prob
-        self.rewards[i]   = reward
-        self.values[i]    = value.squeeze()
-        self.dones[i]     = float(done)
+        self.rewards[i] = reward
+        self.values[i] = value.squeeze()
+        self.dones[i] = float(done)
         self.ptr += 1
 
         if self.ptr == self.buffer_size:
@@ -685,10 +959,14 @@ class RolloutBuffer:
                 next_non_terminal = 1.0 - self.dones[t].item()
                 next_value = self.values[t + 1].item()
 
-            delta = (self.rewards[t].item()
-                     + self.gamma * next_value * next_non_terminal
-                     - self.values[t].item())
-            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            delta = (
+                self.rewards[t].item()
+                + self.gamma * next_value * next_non_terminal
+                - self.values[t].item()
+            )
+            last_gae = (
+                delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            )
             self.advantages[t] = last_gae
 
         self.returns[:n] = self.advantages[:n] + self.values[:n]
@@ -718,14 +996,14 @@ class RolloutBuffer:
 
             yield {
                 "obs": {
-                    "cam":       self.cam[idx],
-                    "imu":       self.imu[idx],
+                    "imu": self.imu[idx],
                     "waypoints": self.waypoints[idx],
+                    "vis_feat": self.vis_feat[idx],
                 },
-                "actions":       self.actions[idx],
+                "actions": self.actions[idx],
                 "old_log_probs": self.log_probs[idx],
-                "advantages":    self.advantages[idx],
-                "returns":       self.returns[idx],
+                "advantages": self.advantages[idx],
+                "returns": self.returns[idx],
             }
 
 
@@ -733,10 +1011,22 @@ class RolloutBuffer:
 # PPO Trainer
 # ---------------------------------------------------------------------------
 
+
 class PPOTrainer:
     """
-    Proximal Policy Optimisation trainer that ties the rollout buffer, the
-    policy, and the update loop together.
+    Proximal Policy Optimisation trainer for the **dual-rate** policy.
+
+    During rollout collection, every env step is treated as an IMU tick.
+    When the env also provides a new camera frame (indicated by
+    ``obs["new_frame"]`` being truthy, or ``obs["cam"]`` being present),
+    the slow visual encoder is run and its output is cached / stored
+    alongside the transition.
+
+    During the PPO update, only the **fast path** + actor/critic heads are
+    re-evaluated (the stored ``vis_feat`` is treated as a fixed input).
+    The ``FlowEncoder`` CNN is still updated via the gradients that flow
+    through the stored ``vis_feat`` produced during rollout (since we
+    call ``update_vision`` *with* gradients during ``collect_rollout``).
 
     Usage
     -----
@@ -765,14 +1055,13 @@ class PPOTrainer:
         self.ppo_epochs = ppo_epochs
 
         device = str(agent.device)
-        cam_shape = (self.cfg.cam_channels, self.cfg.cam_height, self.cfg.cam_width)
         wp_dim = self.cfg.waypoint_dim * self.cfg.num_waypoints
 
         self.buffer = RolloutBuffer(
             buffer_size=rollout_steps,
-            cam_shape=cam_shape,
             imu_dim=self.cfg.imu_dim,
             wp_dim=wp_dim,
+            vis_feat_dim=self.cfg.flow_feature_dim,
             action_dim=self.cfg.action_dim,
             device=device,
             gamma=self.cfg.gamma,
@@ -780,7 +1069,8 @@ class PPOTrainer:
         )
 
         self.optimiser = torch.optim.Adam(
-            agent.policy.parameters(), lr=self.cfg.lr,
+            agent.policy.parameters(),
+            lr=self.cfg.lr,
         )
 
     # ----- rollout collection ---------------------------------------------
@@ -794,25 +1084,46 @@ class PPOTrainer:
             - ``reset() -> obs``
             - ``step(action) -> (obs, reward, done, info)``
 
-        where ``obs`` is a dict with keys ``"cam"``, ``"imu"``,
-        ``"drone_pos"``.
+        where ``obs`` is a dict with keys:
+            - ``"imu"``       : (6,) float
+            - ``"drone_pos"`` : (3,) float
+            - ``"cam"``       : (H, W, C) uint8/float — **when a new frame
+                                is available**
+            - ``"new_frame"`` : bool — True when ``"cam"`` contains a fresh
+                                frame (optional; if absent, the presence of
+                                ``"cam"`` is used).
 
         Returns:
             info dict with ``total_reward`` and ``episodes_completed``.
         """
         self.buffer.reset()
+        self.agent.reset_vision()
         obs = env.reset()
         total_reward = 0.0
         episodes = 0
 
         for _ in range(self.rollout_steps):
-            # --- prepare tensors (single-step, no batch) ---------------------
-            cam, imu, wp_tensor = self._obs_to_tensors(obs)
+            # --- slow path: update vision if new frame available -------------
+            has_new_frame = obs.get("new_frame", "cam" in obs)
+            if has_new_frame and "cam" in obs:
+                self.agent.update_vision(obs)
+
+            # --- prepare fast-path tensors -----------------------------------
+            imu, wp_tensor = self._obs_to_tensors(obs)
+
+            # Get cached visual features for storage
+            vis_feat = self.agent.policy._vis_feat_cache
+            if vis_feat is None:
+                vis_feat = torch.zeros(
+                    1,
+                    self.cfg.flow_feature_dim,
+                    device=self.agent.device,
+                )
 
             policy_obs = {
-                "cam": cam.unsqueeze(0),
                 "imu": imu.unsqueeze(0),
                 "waypoints": wp_tensor,
+                "vis_feat": vis_feat,
             }
             action, log_prob, value = self.agent.policy.act(policy_obs)
             action_sq = action.squeeze(0)
@@ -823,9 +1134,9 @@ class PPOTrainer:
 
             # --- store -------------------------------------------------------
             self.buffer.store(
-                cam=cam,
                 imu=imu,
                 waypoints=wp_tensor.squeeze(0),
+                vis_feat=vis_feat.squeeze(0),
                 action=action_sq,
                 log_prob=log_prob.squeeze(0),
                 reward=float(reward),
@@ -836,17 +1147,25 @@ class PPOTrainer:
 
             if done:
                 obs = env.reset()
+                self.agent.reset_vision()
                 episodes += 1
             else:
                 obs = next_obs
 
         # --- bootstrap last value --------------------------------------------
-        cam, imu, wp_tensor = self._obs_to_tensors(obs)
+        imu, wp_tensor = self._obs_to_tensors(obs)
+        vis_feat = self.agent.policy._vis_feat_cache
+        if vis_feat is None:
+            vis_feat = torch.zeros(
+                1,
+                self.cfg.flow_feature_dim,
+                device=self.agent.device,
+            )
         with torch.no_grad():
             policy_obs = {
-                "cam": cam.unsqueeze(0),
                 "imu": imu.unsqueeze(0),
                 "waypoints": wp_tensor,
+                "vis_feat": vis_feat,
             }
             _, _, last_value = self.agent.policy.act(policy_obs)
         self.buffer.finish(last_value)
@@ -878,8 +1197,8 @@ class PPOTrainer:
                 returns = batch["returns"]
 
                 # Re-evaluate under current policy
-                new_log_probs, entropy, values = (
-                    self.agent.policy.evaluate_actions(obs, actions)
+                new_log_probs, entropy, values = self.agent.policy.evaluate_actions(
+                    obs, actions
                 )
                 values = values.squeeze(-1)
 
@@ -887,8 +1206,7 @@ class PPOTrainer:
                 ratio = (new_log_probs - old_log_probs).exp()
                 surr1 = ratio * advantages
                 surr2 = (
-                    torch.clamp(ratio, 1.0 - self.cfg.clip_eps,
-                                1.0 + self.cfg.clip_eps)
+                    torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps)
                     * advantages
                 )
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -897,14 +1215,17 @@ class PPOTrainer:
                 value_loss = F.mse_loss(values, returns)
 
                 # --- total loss --------------------------------------------
-                loss = (policy_loss
-                        + self.cfg.value_coef * value_loss
-                        - self.cfg.entropy_coef * entropy.mean())
+                loss = (
+                    policy_loss
+                    + self.cfg.value_coef * value_loss
+                    - self.cfg.entropy_coef * entropy.mean()
+                )
 
                 self.optimiser.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
-                    self.agent.policy.parameters(), self.cfg.max_grad_norm,
+                    self.agent.policy.parameters(),
+                    self.cfg.max_grad_norm,
                 )
                 self.optimiser.step()
 
@@ -912,17 +1233,17 @@ class PPOTrainer:
                 with torch.no_grad():
                     approx_kl = (old_log_probs - new_log_probs).mean().item()
                 total_policy_loss += policy_loss.item()
-                total_value_loss  += value_loss.item()
-                total_entropy     += entropy.mean().item()
-                total_kl          += approx_kl
-                num_batches       += 1
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.mean().item()
+                total_kl += approx_kl
+                num_batches += 1
 
         n = max(num_batches, 1)
         return {
             "policy_loss": total_policy_loss / n,
-            "value_loss":  total_value_loss / n,
-            "entropy":     total_entropy / n,
-            "approx_kl":   total_kl / n,
+            "value_loss": total_value_loss / n,
+            "entropy": total_entropy / n,
+            "approx_kl": total_kl / n,
         }
 
     # ----- helpers --------------------------------------------------------
@@ -931,43 +1252,44 @@ class PPOTrainer:
         """Convert a raw env obs dict to device tensors (no batch dim)."""
         device = self.agent.device
 
-        cam = obs["cam"]
-        if not isinstance(cam, torch.Tensor):
-            cam = torch.as_tensor(cam, dtype=torch.float32)
-        if cam.ndim == 3 and cam.shape[-1] in (1, 3):
-            cam = cam.permute(2, 0, 1)
-        if cam.max() > 1.0:
-            cam = cam / 255.0
-        cam = cam.to(device)
-
         imu = obs["imu"]
         if not isinstance(imu, torch.Tensor):
             imu = torch.as_tensor(imu, dtype=torch.float32)
         imu = imu.to(device)
 
-        drone_pos = tuple(float(x) for x in obs["drone_pos"][:3])
+        dp = [float(x) for x in obs["drone_pos"][:3]]
+        drone_pos: Tuple[float, float, float] = (dp[0], dp[1], dp[2])
+
+        dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+        drone_quat: Tuple[float, float, float, float] = (dq[0], dq[1], dq[2], dq[3])
+
+        assert self.agent._buffer is not None, "Call agent.set_route() first."
         wp_tensor = self.agent._buffer.current_targets_tensor(
-            drone_pos, device=device,
+            drone_pos,
+            drone_quat=drone_quat,
+            device=device,
         )
-        return cam, imu, wp_tensor
+        return imu, wp_tensor
 
 
 # ---------------------------------------------------------------------------
 # Curriculum  — progressive route difficulty
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CurriculumStage:
     """Defines one difficulty level in the training curriculum."""
+
     name: str
-    num_waypoints: int          # how many WPs per episode
-    min_spacing: float          # minimum distance between consecutive WPs (m)
-    max_spacing: float          # maximum distance
-    max_angle_deg: float        # max heading change between consecutive WPs
-    safety_radius: float        # waypoint reach threshold (can relax early on)
-    altitude_range: Tuple[float, float] = (3.0, 7.0)   # (min_z, max_z)
-    success_threshold: float = 0.8   # fraction of WPs reached to "pass"
-    min_episodes: int = 50           # minimum episodes before promotion
+    num_waypoints: int  # how many WPs per episode
+    min_spacing: float  # minimum distance between consecutive WPs (m)
+    max_spacing: float  # maximum distance
+    max_angle_deg: float  # max heading change between consecutive WPs
+    safety_radius: float  # waypoint reach threshold (can relax early on)
+    altitude_range: Tuple[float, float] = (3.0, 7.0)  # (min_z, max_z)
+    success_threshold: float = 0.8  # fraction of WPs reached to "pass"
+    min_episodes: int = 50  # minimum episodes before promotion
 
 
 class CurriculumScheduler:
@@ -1102,8 +1424,10 @@ class CurriculumScheduler:
 
         promoted = False
         stage = self.current_stage
-        if (len(self._history) >= stage.min_episodes
-                and self.success_rate >= stage.success_threshold):
+        if (
+            len(self._history) >= stage.min_episodes
+            and self.success_rate >= stage.success_threshold
+        ):
             promoted = self._promote()
 
         return promoted
