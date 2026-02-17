@@ -23,6 +23,7 @@ PX4_MODEL="${1:-gz_x500_mono_cam}"               # PX4 SITL airframe
 ROS_DOMAIN_ID="${2:-0}"                         # ROS 2 domain isolation
 PX4_GZ_WORLD="${3:-tugbot_depot}"                    # Gazebo world / map name
 PX4_HOME="${PX4_HOME:-/opt/PX4-Autopilot}"      # PX4 source tree
+PX4_PARAMS_FILE="${PX4_PARAMS_FILE:-/workspace/px4.params}"  # QGC text format params
 SESSION="px4sim"                                # tmux session name
 DDS_PORT="8888"                                 # XRCE-DDS UDP port
 FCU_URL="udp://:14540@127.0.0.1:14557"         # MAVROS ↔ PX4 link
@@ -70,8 +71,23 @@ info "  DDS port:           $DDS_PORT"
 info "  FCU URL:            $FCU_URL"
 info "  Lockstep:           ON (PX4 default w/ Gazebo)"
 info "  PX4_SIM_SPEED_FACTOR: $PX4_SIM_SPEED_FACTOR"
+info "  Params file:         $PX4_PARAMS_FILE"
 info "  /use_sim_time:      true (MAVROS + ROS nodes)"
 echo ""
+
+# ── Parse px4.params → PX4_PARAM_* env vars ───────────────
+# PX4 rcS reads env vars named PX4_PARAM_<name> and applies
+# them via `param set` after loading defaults.  This is the
+# cleanest way to override SITL parameters.
+#
+# Format: "vehicle-id  component-id  name  value  type" (tab-sep)
+# We skip comment/blank lines and export each param.
+# ────────────────────────────────────────────────────────────
+PX4_PARAM_EXPORTS=""
+PX4_PARAM_EXPORTS+="export PX4_PARAM_SIM_BAT_ENABLE=0"$'\n'
+PX4_PARAM_EXPORTS+="export PX4_PARAM_SYS_HAS_MAG=1"$'\n'
+info "Forcing SIM_BAT_ENABLE=0 (battery simulation disabled)"
+info "Forcing SYS_HAS_MAG=0 (magnetometer disabled)"
 
 # ============================================================
 # Pane 1 — PX4 SITL + Gazebo Harmonic  (lockstep)
@@ -89,6 +105,9 @@ export PX4_SIM_SPEED_FACTOR=${PX4_SIM_SPEED_FACTOR}
 export PX4_GZ_WORLD=${PX4_GZ_WORLD}
 unset PX4_GZ_STANDALONE
 export HEADLESS=${HEADLESS:-1}
+${PX4_PARAM_EXPORTS}
+rm -f ${PX4_HOME}/build/px4_sitl_default/rootfs/parameters.bson
+rm -f ${PX4_HOME}/build/px4_sitl_default/rootfs/parameters_backup.bson
 echo '──────────────────────────────────────────────────'
 echo '  🛩  PX4 SITL  (lockstep + Gazebo Harmonic)'
 echo '──────────────────────────────────────────────────'
