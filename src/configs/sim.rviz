@@ -115,7 +115,7 @@ Visualization Manager:
       Axes Radius: 0.10000000149011612
       Class: rviz_default_plugins/Pose
       Color: 255; 25; 0
-      Enabled: false
+      Enabled: true
       Head Length: 0.30000001192092896
       Head Radius: 0.10000000149011612
       Name: Pose
@@ -129,7 +129,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /mavros/local_position/pose
-      Value: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -176,25 +176,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 13.348451614379883
+      Distance: 8.547306060791016
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.3075110912322998
-        Y: -0.4263859689235687
-        Z: 0.329285591840744
+        X: -0.3146109879016876
+        Y: 0.08471155166625977
+        Z: 0.6702250838279724
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0353975296020508
+      Pitch: 0.8103982210159302
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 3.10042142868042
+      Yaw: 3.0804429054260254
     Saved: ~
 Window Geometry:
   Displays:

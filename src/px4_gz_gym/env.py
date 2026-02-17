@@ -233,10 +233,11 @@ class PX4GazeboEnv(gym.Env):
         )
         self._gz.step_and_wait(50, step_size=self.step_size)
 
-        # ── 3b. Restart EKF2 so all filter state is wiped ──
-        #    ekf2 stop → start clears covariance, innovation
-        #    history, and fault flags from the previous episode.
-        px4_cmd.restart_ekf2()
+        # ── 3b. Restart PX4 completely (without restarting Gz) ──
+        #    Kills and relaunches PX4 SITL in standalone mode so
+        #    ALL internal state (EKF2, commander, navigator, etc.)
+        #    is wiped clean for the new episode.
+        px4_cmd.restart_px4()
 
         # ── 4. Clear sensor buffers for fresh episode ───────
         self._sensors.clear_imu_buffer()
