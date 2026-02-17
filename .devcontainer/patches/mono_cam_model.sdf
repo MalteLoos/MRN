@@ -53,8 +53,8 @@
         <camera>
           <horizontal_fov>1.74</horizontal_fov>
           <image>
-            <width>256</width>
-            <height>256</height>
+            <width>128</width>
+            <height>128</height>
           </image>
           <clip>
             <near>0.1</near>

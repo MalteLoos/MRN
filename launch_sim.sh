@@ -9,8 +9,9 @@
 #   Pane 2 — MAVROS 2  (MAVLink ↔ ROS 2, /use_sim_time)
 #
 # Usage:
-#   ./launch_sim.sh              # defaults: gz_x500, domain 0
-#   ./launch_sim.sh gz_x500_depth  1   # custom model & domain
+#   ./launch_sim.sh                        # defaults: gz_x500, domain 0, default world
+#   ./launch_sim.sh gz_x500_depth 1         # custom model & domain
+#   ./launch_sim.sh gz_x500 0 baylands      # custom model, domain & world/map
 #
 # Requirements: tmux, PX4 Autopilot, MicroXRCEAgent, ROS 2,
 #               MAVROS 2, Gazebo Harmonic
@@ -20,6 +21,7 @@ set -euo pipefail
 # ── Configurable parameters ────────────────────────────────
 PX4_MODEL="${1:-gz_x500_mono_cam}"               # PX4 SITL airframe
 ROS_DOMAIN_ID="${2:-0}"                         # ROS 2 domain isolation
+PX4_GZ_WORLD="${3:-tugbot_depot}"                    # Gazebo world / map name
 PX4_HOME="${PX4_HOME:-/opt/PX4-Autopilot}"      # PX4 source tree
 SESSION="px4sim"                                # tmux session name
 DDS_PORT="8888"                                 # XRCE-DDS UDP port
@@ -62,6 +64,7 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 info "Starting simulation stack …"
 info "  Model:              $PX4_MODEL"
+info "  World / map:        $PX4_GZ_WORLD"
 info "  ROS_DOMAIN_ID:      $ROS_DOMAIN_ID"
 info "  DDS port:           $DDS_PORT"
 info "  FCU URL:            $FCU_URL"
@@ -83,6 +86,7 @@ tmux new-session -d -s "$SESSION" -n sim \
 ${PREAMBLE}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
 export PX4_SIM_SPEED_FACTOR=${PX4_SIM_SPEED_FACTOR}
+export PX4_GZ_WORLD=${PX4_GZ_WORLD}
 unset PX4_GZ_STANDALONE
 export HEADLESS=${HEADLESS:-1}
 echo '──────────────────────────────────────────────────'

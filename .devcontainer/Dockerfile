@@ -176,7 +176,10 @@ RUN pip3 install --no-cache-dir --upgrade pip \
         empy==3.3.4 \
         pyros-genmsg \
         catkin_pkg \
-        lark
+        lark \
+    # Pin protobuf to 3.20.x — gz.msgs10 generated stubs are
+    # incompatible with protobuf >= 4.x (descriptor API change).
+    && pip3 install --no-cache-dir 'protobuf>=3.20,<4'
 USER root
 
 # ── 9. Permissions & shell configuration ───────────────────

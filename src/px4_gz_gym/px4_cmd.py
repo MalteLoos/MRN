@@ -124,7 +124,7 @@ class _PX4Cmd(Node):
         # Attitude setpoint  (roll / pitch / thrust)
         self._attitude_pub = self.create_publisher(
             VehicleAttitudeSetpoint,
-            "/fmu/in/vehicle_attitude_setpoint",
+            "/fmu/in/vehicle_attitude_setpoint_v1",
             10,
         )
 

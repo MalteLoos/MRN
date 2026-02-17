@@ -10,7 +10,7 @@ directly from the Gazebo ↔ ROS 2 bridge:
 
 Publishes:
     /fmu/in/offboard_control_mode  (px4_msgs/OffboardControlMode)
-    /fmu/in/vehicle_attitude_setpoint  (px4_msgs/VehicleAttitudeSetpoint)
+    /fmu/in/vehicle_attitude_setpoint_v1  (px4_msgs/VehicleAttitudeSetpoint)
 
     The node sends **attitude setpoints** (roll, pitch, thrust) directly
     to PX4 over the DDS agent — no intermediate body-rate topic.
@@ -158,7 +158,7 @@ class DroneAttitudeNode(Node):
         )
         self._pub_attitude = self.create_publisher(
             VehicleAttitudeSetpoint,
-            "/fmu/in/vehicle_attitude_setpoint",
+            "/fmu/in/vehicle_attitude_setpoint_v1",
             10,
         )
 
