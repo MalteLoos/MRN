@@ -120,11 +120,14 @@ class PX4GazeboEnv(gym.Env):
         takeoff_alt: float = 2.5,
         enable_rviz: bool = True,
         render_mode: Optional[str] = None,
+        instance_id: int = 0,
+        gz_step_controller: Optional["GzStepController"] = None,
     ) -> None:
         super().__init__()
 
         # ── config ──────────────────────────────────────────
         self.world_name = world_name
+        self.instance_id = instance_id
         self.model_name = model_name
         self.base_model = base_model
         self.n_gz_steps = n_gz_steps
@@ -137,6 +140,9 @@ class PX4GazeboEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.takeoff_alt = takeoff_alt
         self.render_mode = render_mode
+        # If a shared stepper is provided, this env won't step
+        # Gazebo itself — the caller is responsible.
+        self._external_step = gz_step_controller is not None
 
         # Path to the SDF used to (re-)spawn the drone.
         _px4_home = os.environ.get("PX4_HOME", "/opt/PX4-Autopilot")
@@ -198,13 +204,14 @@ class PX4GazeboEnv(gym.Env):
         )
 
         # ── Gazebo transport ────────────────────────────────
-        self._gz = GzStepController(world_name=world_name)
+        self._gz = gz_step_controller or GzStepController(world_name=world_name)
         self._sensors = GzSensors(
             world_name=world_name,
             model_name=model_name,
             cam_obs_height=cam_obs_height,
             cam_obs_width=cam_obs_width,
             enable_rviz=enable_rviz,
+            instance_id=self.instance_id,
         )
 
         # ── bookkeeping ─────────────────────────────────────
@@ -229,16 +236,20 @@ class PX4GazeboEnv(gym.Env):
             return self._gz.step_and_wait(n, step_size=self.step_size)
 
         # ── 1. Force-disarm (sim-stepped wait) ──────────────
-        px4_cmd.force_disarm()
+        px4_cmd.force_disarm(instance_id=self.instance_id)
         px4_cmd.stepped_wait_for_disarm(
-            _step, steps_per_iter=50, max_iters=50,
+            _step,
+            steps_per_iter=50,
+            max_iters=50,
+            instance_id=self.instance_id,
         )
 
         # ── 2. Pause & teleport to spawn pose ──────────────
         self._gz.pause()
+        spawn_y = self.instance_id * 3.0  # offset per instance
         self._gz.set_model_pose(
             self.model_name,
-            position=(0.0, 0.0, 0.0),
+            position=(0.0, spawn_y, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
         _step(50)  # settle physics
@@ -246,7 +257,9 @@ class PX4GazeboEnv(gym.Env):
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
         #    Sleeps inside are minimal (~20 ms for tmux delivery).
         #    Actual convergence time is provided by sim-stepping below.
-        px4_cmd.restart_px4()
+        px4_cmd.restart_px4(
+            tmux_target=f"px4sim_w{self.instance_id}:sim.1",
+        )
 
         # Give PX4 modules sim-time to re-initialise.
         # 500 steps = 2 s sim-time — enough for EKF2 to converge
@@ -258,9 +271,12 @@ class PX4GazeboEnv(gym.Env):
         self._sensors.clear_trajectory()
 
         # ── 5. Wait for PX4 DDS connection (sim-stepped) ───
-        px4_cmd.clear_state()
+        px4_cmd.clear_state(instance_id=self.instance_id)
         px4_cmd.stepped_wait_for_connection(
-            _step, steps_per_iter=50, max_iters=300,
+            _step,
+            steps_per_iter=50,
+            max_iters=300,
+            instance_id=self.instance_id,
         )
 
         # ── 6. Stream attitude-mode offboard heartbeats ────
@@ -273,6 +289,7 @@ class PX4GazeboEnv(gym.Env):
             sim_seconds=2.0,
             ticks_per_publish=self.n_gz_steps,
             step_size=self.step_size,
+            instance_id=self.instance_id,
         )
 
         # ── 7. Switch to OFFBOARD + arm (attitude mode) ────
@@ -283,6 +300,7 @@ class PX4GazeboEnv(gym.Env):
             step_size=self.step_size,
             offboard_timeout_s=10.0,
             arm_timeout_s=10.0,
+            instance_id=self.instance_id,
         )
 
         # ── 9. Pause again for deterministic stepping ──────
@@ -302,6 +320,35 @@ class PX4GazeboEnv(gym.Env):
         """Forward body-frame waypoint tensor to ROS 2 for debugging."""
         self._sensors.publish_waypoints_relative(wp_flat)
 
+    # ── split step API for shared-Gazebo multi-env ────────────
+
+    def apply_action_only(self, action: np.ndarray) -> None:
+        """Send the attitude setpoint to PX4 without stepping Gazebo.
+
+        Use this in shared-Gazebo setups where a single caller
+        steps the world after *all* envs have applied their actions.
+        """
+        action = np.asarray(action, dtype=np.float32)
+        self._apply_action(action)
+
+    def observe_only(
+        self,
+        action: np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+        """Read sensors and compute reward/done *without* stepping.
+
+        Call this after the shared Gazebo world has been stepped
+        externally.  ``action`` is used only for reward computation.
+        """
+        action = np.asarray(action, dtype=np.float32)
+        obs = self._sensors.get_obs()
+        reward = self._compute_reward(obs, action)
+        terminated = self._is_terminated(obs)
+        self._step_count += 1
+        truncated = self._step_count >= self.max_episode_steps
+        info = self._build_info(sim_time=self._gz.sim_time)
+        return obs, reward, terminated, truncated, info
+
     def step(
         self,
         action: np.ndarray,
@@ -310,6 +357,9 @@ class PX4GazeboEnv(gym.Env):
         Apply *action* (roll, pitch, yaw_rate, thrust), advance the sim
         by ``n_gz_steps`` physics steps, and return the resulting
         observation dict.
+
+        In external-step mode (shared Gazebo), this still works as a
+        convenience — apply, step, observe in one call.
         """
         action = np.asarray(action, dtype=np.float32)
 
@@ -386,6 +436,7 @@ class PX4GazeboEnv(gym.Env):
             pitch=pitch_cmd,
             yaw=yaw_cmd,
             thrust=thrust_cmd,
+            instance_id=self.instance_id,
         )
 
     # ════════════════════════════════════════════════════════

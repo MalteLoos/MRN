@@ -274,7 +274,14 @@ class DummyHoverEnv:
         act_mag = float(np.sum(action[:3] ** 2))
         thrust = float(action[3] + 1.0) / 2.0
         low_thrust_penalty = max(0.0, 0.3 - thrust) * 5.0
-        return -1.0 * alt_err - 0.5 * horiz - 0.2 * speed - 0.05 * act_mag - low_thrust_penalty + 0.1
+        return (
+            -1.0 * alt_err
+            - 0.5 * horiz
+            - 0.2 * speed
+            - 0.05 * act_mag
+            - low_thrust_penalty
+            + 0.1
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -304,15 +311,12 @@ def make_env(args):
     num_envs = getattr(args, "num_envs", 1)
 
     if num_envs > 1:
-        # Multi-process: each worker gets its own sim stack
-        from px4_gz_gym.vec_env import SubprocVecEnv
+        # In-process: all envs share one Gazebo world
+        from px4_gz_gym.vec_env import SharedGzVecEnv
 
-        launch_script = getattr(args, "launch_script", "")
-        return SubprocVecEnv.from_args(
+        return SharedGzVecEnv.from_args(
             num_envs=num_envs,
             args=args,
-            base_domain_id=10,
-            launch_script=launch_script,
         )
 
     # Single-process: direct PX4GazeboEnv
@@ -460,33 +464,30 @@ def collect_rollout_vec(
     cfg: ModelConfig,
     hover_alt: float = 2.5,
 ) -> dict[str, float]:
-    """Collect transitions from **N parallel envs** round-robin.
+    """Collect transitions from **N parallel envs** (shared Gazebo).
 
-    Each env steps independently; done envs are reset inline.
-    Transitions from all envs are interleaved into a single
-    ``RolloutBuffer`` in deterministic env-index order.
+    All envs are stepped synchronously: actions are applied to all
+    envs, then Gazebo is stepped ONCE, then observations are
+    collected from all envs.  Transitions from all envs are
+    interleaved into a single ``RolloutBuffer`` in deterministic
+    env-index order.
 
     The buffer must be sized for ``rollout_steps`` total transitions
     (spread across all envs).
 
     Determinism
     ~~~~~~~~~~~
-    * Each env performs its own deterministic sim-stepped reset.
+    * All envs advance in lockstep via a single shared Gazebo world.
     * Results are always processed in env-index order (0, 1, …, N-1)
       so the buffer contents are reproducible for the same seeds.
     """
-    from px4_gz_gym.vec_env import SubprocVecEnv, AsyncResetVecEnv
-
     num_envs = vec_env.num_envs
     buffer.reset()
     agent.reset_vision()
     device = agent.device
 
     # ── Initial reset of all envs ────────────────────────────
-    if isinstance(vec_env, AsyncResetVecEnv):
-        obs_list = vec_env.reset_all()
-    else:
-        obs_list = vec_env.reset_all()
+    obs_list = vec_env.reset_all()
 
     # Wrap raw obs in HoverEnvWrapper-style remap
     def _remap(obs_dict: dict) -> dict:
@@ -539,7 +540,9 @@ def collect_rollout_vec(
             dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
             drone_quat = (dq[0], dq[1], dq[2], dq[3])
             wp_tensor = agent._buffer.current_targets_tensor(
-                drone_pos, drone_quat=drone_quat, device=device,
+                drone_pos,
+                drone_quat=drone_quat,
+                device=device,
             )
 
             vis_feat = agent.policy._vis_feat_cache
@@ -565,30 +568,23 @@ def collect_rollout_vec(
         if n_active == 0:
             break
 
-        # ── Step all active envs in parallel ─────────────────
-        if isinstance(vec_env, AsyncResetVecEnv):
-            step_results = vec_env.step(
-                [np.asarray(a, dtype=np.float32) for a in actions]
-                + [np.zeros(4, dtype=np.float32)] * (num_envs - n_active)
-            )
-        else:
-            step_results = vec_env.step(
-                [np.asarray(a, dtype=np.float32) for a in actions]
-                + [np.zeros(4, dtype=np.float32)] * (num_envs - n_active)
-            )
+        # Pad actions to num_envs (idle envs get zero action)
+        padded_actions = [np.asarray(a, dtype=np.float32) for a in actions] + [
+            np.zeros(4, dtype=np.float32)
+        ] * (num_envs - n_active)
+
+        # ── Step all envs synchronously ──────────────────────
+        # SharedGzVecEnv.step() does:
+        #   apply_action_only() on ALL → step_and_wait() ONCE → observe_only() on ALL
+        step_results = vec_env.step(padded_actions)
 
         # ── Store transitions (deterministic env-index order) ─
         for i in range(n_active):
             if steps_collected >= rollout_steps:
                 break
 
-            if isinstance(vec_env, AsyncResetVecEnv):
-                obs_raw, reward, done, info = step_results[i]
-                next_obs_raw = obs_raw
-            else:
-                obs_raw, reward, term, trunc, info = step_results[i]  # type: ignore[misc]
-                done = bool(term or trunc)
-                next_obs_raw = obs_raw
+            obs_raw, reward, term, trunc, info = step_results[i]
+            done = bool(term or trunc)
 
             buffer.store(
                 imu=imus[i],
@@ -604,19 +600,14 @@ def collect_rollout_vec(
             steps_collected += 1
 
             if done:
-                if isinstance(vec_env, AsyncResetVecEnv):
-                    # Reset obs will be collected on next step
-                    reset_obs = vec_env.get_reset_obs(i)
-                    obs_per_env[i] = _remap(reset_obs)
-                else:
-                    reset_obs = vec_env.reset_one(i)
-                    obs_per_env[i] = _remap(reset_obs)
+                reset_obs = vec_env.reset_one(i)
+                obs_per_env[i] = _remap(reset_obs)
                 agent.reset_vision()
                 hover_pos = (0.0, 0.0, hover_alt)
                 agent.set_route([hover_pos, hover_pos])
                 episodes += 1
             else:
-                obs_per_env[i] = _remap(next_obs_raw)
+                obs_per_env[i] = _remap(obs_raw)
 
     # ── Bootstrap last value ─────────────────────────────────
     obs = obs_per_env[0]
@@ -629,7 +620,9 @@ def collect_rollout_vec(
     drone_quat = (dq[0], dq[1], dq[2], dq[3])
     assert agent._buffer is not None
     wp_tensor = agent._buffer.current_targets_tensor(
-        drone_pos, drone_quat=drone_quat, device=device,
+        drone_pos,
+        drone_quat=drone_quat,
+        device=device,
     )
     vis_feat = agent.policy._vis_feat_cache
     if vis_feat is None:
@@ -816,17 +809,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num-envs",
         type=int,
-        default=1,
-        help="Number of parallel PX4+Gazebo environments (each gets its own sim stack).",
+        default=3,
+        help="Number of parallel PX4 instances (shared Gazebo world).",
     )
-    p.add_argument(
-        "--launch-script",
-        type=str,
-        default="",
-        help="Path to launch_sim.sh for auto-launching per-worker sim stacks. "
-        "Leave empty if sims are already running.",
-    )
-
     # ── checkpointing & logging ─────────────────────────────────────────
     p.add_argument(
         "--run-dir",
@@ -847,11 +832,23 @@ def parse_args() -> argparse.Namespace:
     # ── hardware ────────────────────────────────────────────────────────
     p.add_argument("--device", type=str, default="cuda", help="'cpu' or 'cuda'.")
 
+    # ── ROS / DDS ───────────────────────────────────────────────────────
+    p.add_argument(
+        "--domain-id",
+        type=int,
+        default=10,
+        help="ROS_DOMAIN_ID (must match launch_parallel.sh BASE_DOMAIN_ID).",
+    )
+
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # ── Set ROS_DOMAIN_ID BEFORE any rclpy / env initialisation ─────
+    os.environ["ROS_DOMAIN_ID"] = str(args.domain_id)
+
     os.makedirs(args.run_dir, exist_ok=True)
 
     # ── Weights & Biases (offline) ──────────────────────────────────────

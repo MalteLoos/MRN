@@ -1,244 +1,126 @@
 """
-vec_env.py — Subprocess-based vectorised PX4+Gazebo environment.
+vec_env.py — In-process vectorised PX4+Gazebo environment for shared worlds.
 
-Runs *N* independent PX4 SITL instances (each in its own tmux
-session with a unique ``ROS_DOMAIN_ID``) so that episode resets
-in one env don't block the others.
+All *N* PX4 SITL instances run in a **single Gazebo world**.
+Stepping Gazebo advances ALL drones simultaneously, so we cannot
+step envs independently.  Instead:
+
+    apply_action_only() on ALL envs
+            ↓
+    ONE step_and_wait()   (shared GzStepController)
+            ↓
+    observe_only()  on ALL envs
 
 Architecture
 ------------
 ::
 
-    Main process (training)
+    Training process
         │
-        ├── Worker-0  (ROS_DOMAIN_ID=10, tmux=px4sim_w0)
-        │     └── PX4GazeboEnv  → steps / resets independently
-        ├── Worker-1  (ROS_DOMAIN_ID=11, tmux=px4sim_w1)
-        │     └── PX4GazeboEnv  → steps / resets independently
+        ├── GzStepController       (one world stepper)
+        ├── PX4GazeboEnv[0]        instance_id=0, model=x500_mono_cam_0
+        ├── PX4GazeboEnv[1]        instance_id=1, model=x500_mono_cam_1
         └── ...
 
-Each worker is a ``multiprocessing.Process`` that owns a full
-``PX4GazeboEnv`` instance.  Communication uses ``Pipe`` pairs
-for deterministic, ordered message passing.
+All instances share a single ``ROS_DOMAIN_ID``.  Topic isolation
+is via PX4's DDS namespace (``PX4_UXRCE_DDS_NS=px4_<i>``), so
+each env's ``px4_cmd`` calls target the correct autopilot.
+
+Reset strategy
+~~~~~~~~~~~~~~
+When **any** env signals done, we batch-reset **all** envs
+together.  During the reset steps (EKF convergence, offboard
+arming, etc.), non-resetting envs would also see Gazebo advance,
+so we send them offboard heartbeats to maintain their hold.
+
+For simplicity, the current implementation resets all envs at
+the same time — episodes are the same length (truncated at
+``max_episode_steps``), so done signals naturally align.
 
 Usage
 -----
 ::
 
-    vec = SubprocVecEnv.from_args(num_envs=2, args=args)
-    obs_list = vec.reset_all()         # list of N obs dicts
+    vec = SharedGzVecEnv.from_args(num_envs=3, args=args)
+    obs_list = vec.reset_all()
     for step in range(rollout_steps):
-        # ... compute actions ...
-        results = vec.step(actions)    # list of (obs, rew, done, info)
+        results = vec.step(actions)
     vec.close()
-
-Determinism guarantees
-~~~~~~~~~~~~~~~~~~~~~~
-* Each env advances its own sim independently — there is no
-  cross-env sim-time coupling.
-* Within each env, the sim-stepped reset + lockstep stepping
-  is fully deterministic (same physics steps, same PX4 state
-  machine transitions).
-* The training loop processes results in env-index order,
-  ensuring reproducible rollout buffers given the same seed.
 """
 
 from __future__ import annotations
 
-import multiprocessing as mp
-from multiprocessing.connection import Connection
 import os
-import signal
-import subprocess
-import sys
 import time
-import traceback
 from typing import Any, Optional
 
 import numpy as np
 
-
-# ── Commands sent parent → worker ───────────────────────────
-
-CMD_RESET = "reset"
-CMD_STEP = "step"
-CMD_CLOSE = "close"
-CMD_GET_OBS = "get_obs"
+from px4_gz_gym.gz_step import GzStepController
+from px4_gz_gym.env import PX4GazeboEnv
+from px4_gz_gym import px4_cmd
 
 
-# ════════════════════════════════════════════════════════════
-#  Worker process
-# ════════════════════════════════════════════════════════════
+class SharedGzVecEnv:
+    """In-process vectorised environment sharing one Gazebo world.
 
-
-def _worker_fn(
-    pipe: Connection,
-    worker_id: int,
-    env_kwargs: dict[str, Any],
-    domain_id: int,
-    launch_script: str,
-) -> None:
-    """Entry point for each subprocess worker.
-
-    1. Sets ``ROS_DOMAIN_ID`` so topics don't collide.
-    2. Launches its own sim stack via ``launch_sim.sh``.
-    3. Creates a ``PX4GazeboEnv`` and enters a command loop.
-    """
-    # Isolate ROS 2 domain
-    os.environ["ROS_DOMAIN_ID"] = str(domain_id)
-    tmux_session = f"px4sim_w{worker_id}"
-    os.environ["PX4_TMUX_SESSION"] = tmux_session
-
-    env = None
-    sim_proc = None
-
-    try:
-        # ── Launch sim stack in a dedicated tmux session ────
-        if launch_script and os.path.isfile(launch_script):
-            sim_proc = subprocess.Popen(
-                [
-                    "bash",
-                    launch_script,
-                ],
-                env={
-                    **os.environ,
-                    "SESSION": tmux_session,
-                    "ROS_DOMAIN_ID": str(domain_id),
-                },
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Give the sim stack time to start
-            time.sleep(15)
-
-        # ── Create environment ──────────────────────────────
-        # Import inside worker so each process gets its own
-        # rclpy context and gz-transport node.
-        from px4_gz_gym.env import PX4GazeboEnv
-
-        # Override tmux target for PX4 NSH commands
-        from px4_gz_gym import px4_cmd
-        px4_cmd._DEFAULT_TMUX_TARGET = f"{tmux_session}:sim.1"
-
-        env = PX4GazeboEnv(**env_kwargs)
-
-        # ── Command loop ────────────────────────────────────
-        while True:
-            try:
-                cmd, data = pipe.recv()
-            except EOFError:
-                break
-
-            if cmd == CMD_RESET:
-                try:
-                    obs, info = env.reset()
-                    pipe.send(("ok", (obs, info)))
-                except Exception as e:
-                    pipe.send(("err", traceback.format_exc()))
-
-            elif cmd == CMD_STEP:
-                try:
-                    action = data
-                    obs, rew, term, trunc, info = env.step(action)
-                    pipe.send(("ok", (obs, rew, term, trunc, info)))
-                except Exception as e:
-                    pipe.send(("err", traceback.format_exc()))
-
-            elif cmd == CMD_CLOSE:
-                break
-
-            else:
-                pipe.send(("err", f"Unknown command: {cmd}"))
-
-    except Exception:
-        traceback.print_exc()
-    finally:
-        if env is not None:
-            try:
-                env.close()
-            except Exception:
-                pass
-        # Kill the sim tmux session
-        subprocess.run(
-            ["tmux", "kill-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        pipe.close()
-
-
-# ════════════════════════════════════════════════════════════
-#  SubprocVecEnv
-# ════════════════════════════════════════════════════════════
-
-
-class SubprocVecEnv:
-    """Vectorised PX4+Gazebo environment using subprocesses.
-
-    Each worker runs a full sim stack (PX4 + Gazebo + DDS agent)
-    in an isolated ROS 2 domain.  Resets are non-blocking across
-    workers: while one env resets, others can continue stepping.
+    All ``PX4GazeboEnv`` instances live in the main process and
+    share a single ``GzStepController``.  Stepping is synchronised:
+    actions are applied to ALL envs, then Gazebo is stepped ONCE,
+    then observations are collected from ALL envs.
 
     Parameters
     ----------
     num_envs : int
-        Number of parallel environments.
+        Number of parallel drone instances.
     env_kwargs : dict
-        Keyword arguments passed to ``PX4GazeboEnv()``.
-    base_domain_id : int
-        First ``ROS_DOMAIN_ID``; workers use ``base + i``.
-    launch_script : str
-        Path to ``launch_sim.sh``.  Each worker launches its own
-        sim stack.  Pass ``""`` to skip (useful if sims are
-        already running).
+        Base keyword arguments for ``PX4GazeboEnv``.  ``instance_id``,
+        ``model_name``, and ``gz_step_controller`` are set per-env.
+    world_name : str
+        Gazebo world name (shared across all envs).
+    base_model : str
+        PX4 model base name (e.g. ``"x500_mono_cam"``).
+        Model names become ``{base_model}_{i}``.
     """
 
     def __init__(
         self,
         num_envs: int,
         env_kwargs: dict[str, Any],
-        base_domain_id: int = 10,
-        launch_script: str = "",
+        world_name: str = "tugbot_depot",
+        base_model: str = "x500_mono_cam",
     ) -> None:
         self.num_envs = num_envs
         self._closed = False
 
-        self._parent_pipes: list[Connection] = []
-        self._child_pipes: list[Connection] = []
-        self._workers: list[mp.Process] = []
+        # ── Shared Gazebo stepper ──────────────────────────
+        self._gz = GzStepController(world_name=world_name)
 
-        ctx = mp.get_context("spawn")
+        # ── Per-instance env config ────────────────────────
+        self._n_gz_steps: int = env_kwargs.get("n_gz_steps", 5)
+        self._step_size: float = env_kwargs.get("step_size", 0.004)
 
+        self.envs: list[PX4GazeboEnv] = []
         for i in range(num_envs):
-            parent_conn, child_conn = ctx.Pipe()
-            self._parent_pipes.append(parent_conn)
-            self._child_pipes.append(child_conn)
-
-            w = ctx.Process(
-                target=_worker_fn,
-                args=(
-                    child_conn,
-                    i,
-                    env_kwargs,
-                    base_domain_id + i,
-                    launch_script,
-                ),
-                daemon=True,
-                name=f"px4_env_worker_{i}",
-            )
-            w.start()
-            self._workers.append(w)
-            # Close child end in parent
-            child_conn.close()
+            kw = dict(env_kwargs)
+            kw["instance_id"] = i
+            kw["model_name"] = f"{base_model}_{i}"
+            kw["gz_step_controller"] = self._gz
+            kw["world_name"] = world_name
+            # Disable per-env RViz for instances > 0 to avoid
+            # topic collisions and overhead.
+            if i > 0:
+                kw["enable_rviz"] = False
+            env = PX4GazeboEnv(**kw)
+            self.envs.append(env)
 
     @classmethod
     def from_args(
         cls,
         num_envs: int,
         args,
-        base_domain_id: int = 10,
-        launch_script: str = "",
-    ) -> "SubprocVecEnv":
-        """Create from parsed CLI args (same as ``make_env``)."""
+    ) -> "SharedGzVecEnv":
+        """Create from parsed CLI args (same fields as train_hover)."""
         env_kwargs = dict(
             world_name=args.world,
             cam_obs_height=args.cam_size,
@@ -249,56 +131,121 @@ class SubprocVecEnv:
         return cls(
             num_envs=num_envs,
             env_kwargs=env_kwargs,
-            base_domain_id=base_domain_id,
-            launch_script=launch_script,
+            world_name=args.world,
         )
 
-    # ── Vectorised API ──────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    #  Vectorised API
+    # ════════════════════════════════════════════════════════
 
-    def reset_all(
-        self,
-        timeout: float = 120.0,
-    ) -> list[dict[str, np.ndarray]]:
-        """Reset all environments in parallel.  Returns list of obs."""
-        for pipe in self._parent_pipes:
-            pipe.send((CMD_RESET, None))
+    def reset_all(self) -> list[dict[str, np.ndarray]]:
+        """Reset all environments.
 
-        results = []
-        for i, pipe in enumerate(self._parent_pipes):
-            if pipe.poll(timeout):
-                status, data = pipe.recv()
-                if status == "ok":
-                    obs, info = data
-                    results.append(obs)
-                else:
-                    raise RuntimeError(
-                        f"Worker {i} reset failed:\n{data}"
-                    )
+        Resets are serialised: each ``env.reset()`` performs its
+        own sequence of sim-steps (force-disarm, teleport, EKF
+        convergence, arming).  Because they share the same Gazebo
+        world, stepping during one env's reset advances physics
+        for ALL drones.
+
+        Already-reset envs receive offboard attitude heartbeats
+        during each subsequent reset so they don't lose OFFBOARD
+        mode while PX4 times out waiting for heartbeats.
+        """
+        obs_list: list[dict[str, np.ndarray]] = []
+        for idx, env in enumerate(self.envs):
+            if idx == 0:
+                # First env — no previously-reset envs to keep alive.
+                obs, _info = env.reset()
             else:
-                raise TimeoutError(f"Worker {i} reset timed out")
+                # Wrap the env's step function to also send heartbeats
+                # to all already-reset envs (indices 0..idx-1).
+                obs = self._reset_with_heartbeats(idx)
+            obs_list.append(obs)
+        return obs_list
 
-        return results
+    def _reset_with_heartbeats(
+        self,
+        env_idx: int,
+    ) -> dict[str, np.ndarray]:
+        """Reset env *env_idx* while keeping envs 0..env_idx-1 alive.
+
+        Monkey-patches the shared GzStepController's ``step_and_wait``
+        during the reset so that every sim-step batch also publishes
+        offboard attitude heartbeats to the previously-reset envs.
+        """
+        env = self.envs[env_idx]
+        original_step = env._gz.step_and_wait
+
+        def _step_with_heartbeats(n: int, step_size: float = 0.004) -> float:
+            # Send heartbeats to all already-reset envs before stepping
+            for j in range(env_idx):
+                px4_cmd.publish_offboard_attitude_heartbeat(
+                    instance_id=j,
+                )
+            return original_step(n, step_size=step_size)
+
+        env._gz.step_and_wait = _step_with_heartbeats  # type: ignore[assignment]
+        try:
+            obs, _info = env.reset()
+        finally:
+            env._gz.step_and_wait = original_step  # type: ignore[assignment]
+        return obs
 
     def reset_one(
         self,
         env_idx: int,
-        timeout: float = 120.0,
     ) -> dict[str, np.ndarray]:
-        """Reset a single environment.  Returns obs dict."""
-        self._parent_pipes[env_idx].send((CMD_RESET, None))
-        if self._parent_pipes[env_idx].poll(timeout):
-            status, data = self._parent_pipes[env_idx].recv()
-            if status == "ok":
-                return data[0]  # obs
-            raise RuntimeError(f"Worker {env_idx} reset failed:\n{data}")
-        raise TimeoutError(f"Worker {env_idx} reset timed out")
+        """Reset a single environment.
+
+        During the reset steps, other envs will also see the
+        physics advance.  We send offboard heartbeats to the
+        non-resetting envs so they don't lose offboard mode.
+
+        Returns the reset observation for env_idx.
+        """
+        # Define a custom step function that also sends heartbeats
+        # to the non-resetting envs during the reset sim-steps.
+        def _step_with_heartbeats(n: int) -> float:
+            """Step Gazebo n times while keeping other envs alive."""
+            for _ in range(n):
+                # Send offboard heartbeats to non-resetting envs
+                for j, env in enumerate(self.envs):
+                    if j == env_idx:
+                        continue
+                    px4_cmd.publish_offboard_attitude_heartbeat(
+                        instance_id=j,
+                    )
+                self._gz.step_and_wait(
+                    n=1, step_size=self._step_size,
+                )
+            return self._gz.sim_time
+
+        # Temporarily monkey-patch the env's _gz.step_and_wait to
+        # use our heartbeat-sending stepper during reset.
+        env = self.envs[env_idx]
+        original_step = env._gz.step_and_wait
+
+        def _patched_step(n: int, step_size: float = 0.004) -> float:
+            return _step_with_heartbeats(n)
+
+        env._gz.step_and_wait = _patched_step  # type: ignore[assignment]
+        try:
+            obs, _info = env.reset()
+        finally:
+            env._gz.step_and_wait = original_step  # type: ignore[assignment]
+
+        return obs
 
     def step(
         self,
         actions: list[np.ndarray],
         timeout: float = 30.0,
     ) -> list[tuple[dict, float, bool, bool, dict]]:
-        """Step all environments with the given actions.
+        """Step all environments with synchronised Gazebo stepping.
+
+        1. Apply actions to all envs (no physics yet).
+        2. Step Gazebo ONCE for all drones.
+        3. Observe results from all envs.
 
         Parameters
         ----------
@@ -311,21 +258,21 @@ class SubprocVecEnv:
         """
         assert len(actions) == self.num_envs
 
-        for pipe, act in zip(self._parent_pipes, actions):
-            pipe.send((CMD_STEP, act))
+        # ── 1. Apply all actions ────────────────────────────
+        for env, action in zip(self.envs, actions):
+            env.apply_action_only(action)
 
-        results = []
-        for i, pipe in enumerate(self._parent_pipes):
-            if pipe.poll(timeout):
-                status, data = pipe.recv()
-                if status == "ok":
-                    results.append(data)
-                else:
-                    raise RuntimeError(
-                        f"Worker {i} step failed:\n{data}"
-                    )
-            else:
-                raise TimeoutError(f"Worker {i} step timed out")
+        # ── 2. Step Gazebo ONCE ─────────────────────────────
+        self._gz.step_and_wait(
+            n=self._n_gz_steps,
+            step_size=self._step_size,
+        )
+
+        # ── 3. Observe all envs ─────────────────────────────
+        results: list[tuple[dict, float, bool, bool, dict]] = []
+        for env, action in zip(self.envs, actions):
+            obs, reward, terminated, truncated, info = env.observe_only(action)
+            results.append((obs, reward, terminated, truncated, info))
 
         return results
 
@@ -333,145 +280,24 @@ class SubprocVecEnv:
         self,
         env_idx: int,
         action: np.ndarray,
-        timeout: float = 30.0,
     ) -> tuple[dict, float, bool, bool, dict]:
-        """Step a single environment."""
-        self._parent_pipes[env_idx].send((CMD_STEP, action))
-        if self._parent_pipes[env_idx].poll(timeout):
-            status, data = self._parent_pipes[env_idx].recv()
-            if status == "ok":
-                return data
-            raise RuntimeError(
-                f"Worker {env_idx} step failed:\n{data}"
-            )
-        raise TimeoutError(f"Worker {env_idx} step timed out")
+        """Step a single environment (applies, steps, observes)."""
+        env = self.envs[env_idx]
+        return env.step(action)
 
     def close(self) -> None:
-        """Shut down all workers and their sim stacks."""
+        """Shut down all environments."""
         if self._closed:
             return
         self._closed = True
-
-        for pipe in self._parent_pipes:
+        for env in self.envs:
             try:
-                pipe.send((CMD_CLOSE, None))
+                env.close()
             except Exception:
                 pass
-
-        for w in self._workers:
-            w.join(timeout=10)
-            if w.is_alive():
-                w.terminate()
-
-        for pipe in self._parent_pipes:
-            pipe.close()
 
     def __del__(self) -> None:
         self.close()
 
     def __len__(self) -> int:
         return self.num_envs
-
-
-# ════════════════════════════════════════════════════════════
-#  Async-reset wrapper  (hides reset latency in stepping)
-# ════════════════════════════════════════════════════════════
-
-
-class AsyncResetVecEnv:
-    """Wraps ``SubprocVecEnv`` to overlap resets with stepping.
-
-    When an env signals ``done``, its reset is initiated
-    immediately but doesn't block.  On the next ``step()``
-    call, if the reset hasn't finished yet, we poll briefly.
-    This amortises the remaining per-env reset cost across the
-    rollout collection.
-
-    **Determinism**: each env still performs a fully deterministic
-    sim-stepped reset.  The only non-determinism would be in
-    wall-clock *ordering* of when resets complete, but since we
-    process envs in fixed index order, the rollout buffer is
-    filled deterministically given the same seeds.
-    """
-
-    def __init__(self, vec_env: SubprocVecEnv) -> None:
-        self.vec = vec_env
-        self.num_envs = vec_env.num_envs
-        self._pending_reset: list[bool] = [False] * self.num_envs
-        self._latest_obs: list[Optional[dict]] = [None] * self.num_envs
-
-    def reset_all(self) -> list[dict]:
-        """Synchronous full reset of all envs."""
-        obs_list = self.vec.reset_all()
-        self._latest_obs = list(obs_list)
-        self._pending_reset = [False] * self.num_envs
-        return obs_list
-
-    def step(
-        self,
-        actions: list[np.ndarray],
-    ) -> list[tuple[dict, float, bool, dict]]:
-        """Step all envs; auto-reset done envs asynchronously.
-
-        Returns 4-tuples (obs, reward, done, info) per env.
-        When an env is done, the returned obs is already the
-        first obs of the new episode.
-        """
-        # Collect pending resets first
-        for i in range(self.num_envs):
-            if self._pending_reset[i]:
-                # Wait for the reset result
-                pipe = self.vec._parent_pipes[i]
-                if pipe.poll(120):
-                    status, data = pipe.recv()
-                    if status == "ok":
-                        self._latest_obs[i] = data[0]  # obs
-                    else:
-                        raise RuntimeError(
-                            f"Worker {i} async reset failed:\n{data}"
-                        )
-                else:
-                    raise TimeoutError(f"Worker {i} async reset timed out")
-                self._pending_reset[i] = False
-
-        # Step all envs
-        results_raw = self.vec.step(actions)
-        results = []
-
-        for i, (obs, rew, term, trunc, info) in enumerate(results_raw):
-            done = term or trunc
-            if done:
-                # Initiate async reset
-                self.vec._parent_pipes[i].send((CMD_RESET, None))
-                self._pending_reset[i] = True
-                # Return the terminal obs — the next step() will
-                # collect the reset obs before stepping again.
-                results.append((obs, rew, True, info))
-            else:
-                self._latest_obs[i] = obs
-                results.append((obs, rew, False, info))
-
-        return results
-
-    def get_reset_obs(self, env_idx: int) -> dict:
-        """Get the obs from a completed async reset.
-
-        Call this after ``step()`` returned done=True for env_idx
-        and before the next ``step()`` call to get the initial
-        observation of the new episode.
-        """
-        if self._pending_reset[env_idx]:
-            pipe = self.vec._parent_pipes[env_idx]
-            if pipe.poll(120):
-                status, data = pipe.recv()
-                if status == "ok":
-                    self._latest_obs[env_idx] = data[0]
-                else:
-                    raise RuntimeError(f"Reset failed:\n{data}")
-            self._pending_reset[env_idx] = False
-        obs = self._latest_obs[env_idx]
-        assert obs is not None, f"No obs available for env {env_idx}"
-        return obs
-
-    def close(self) -> None:
-        self.vec.close()

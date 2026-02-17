@@ -72,10 +72,10 @@ class GzSensors:
     =============  =============  ========================
 
     ROS 2 topics published once per ``get_obs()`` call:
-        * ``/drone/camera/image``  — full-resolution camera
-        * ``/drone/imu``           — 50 Hz averaged IMU
-        * ``/drone/pose``          — drone pose
-        * ``/drone/trajectory``    — cumulative flight path
+        * ``/px4_<i>/drone/camera/image``  — full-resolution camera
+        * ``/px4_<i>/drone/imu``           — 50 Hz averaged IMU
+        * ``/px4_<i>/drone/pose``          — drone pose
+        * ``/px4_<i>/drone/trajectory``    — cumulative flight path
     """
 
     def __init__(
@@ -88,12 +88,14 @@ class GzSensors:
         cam_obs_width: int = 64,
         enable_rviz: bool = True,
         max_traj_len: int = 5_000,
+        instance_id: int = 0,
     ) -> None:
         self.world_name = world_name
         self.model_name = model_name
         self.cam_obs_height = cam_obs_height
         self.cam_obs_width = cam_obs_width
         self._enable_rviz = enable_rviz
+        self._instance_id = instance_id
 
         self._gz_node = Node()
         self._lock = threading.Lock()
@@ -155,8 +157,9 @@ class GzSensors:
     def _init_ros_publishers(self) -> None:
         if not rclpy.ok():
             rclpy.init()
+        ns = f"/px4_{self._instance_id}"
         self._ros_node = RosNode(
-            "gz_sensors_viz",
+            f"gz_sensors_viz_{self._instance_id}",
             parameter_overrides=[
                 rclpy.Parameter(
                     "use_sim_time",
@@ -167,27 +170,27 @@ class GzSensors:
         )
         self._pub_cam = self._ros_node.create_publisher(
             RosImage,
-            "/drone/camera/image",
+            f"{ns}/drone/camera/image",
             10,
         )
         self._pub_imu = self._ros_node.create_publisher(
             RosImu,
-            "/drone/imu",
+            f"{ns}/drone/imu",
             10,
         )
         self._pub_pose = self._ros_node.create_publisher(
             PoseStamped,
-            "/drone/pose",
+            f"{ns}/drone/pose",
             10,
         )
         self._pub_traj = self._ros_node.create_publisher(
             Path,
-            "/drone/trajectory",
+            f"{ns}/drone/trajectory",
             10,
         )
         self._pub_wp_rel = self._ros_node.create_publisher(
             Float32MultiArray,
-            "/drone/waypoints_relative",
+            f"{ns}/drone/waypoints_relative",
             10,
         )
 

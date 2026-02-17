@@ -81,11 +81,21 @@ _PX4_CUSTOM_SUB_MODE_AUTO_LAND = 6
 
 
 class _PX4Cmd(Node):
-    """Thin ROS 2 helper for commanding PX4 via the DDS agent."""
+    """Thin ROS 2 helper for commanding PX4 via the DDS agent.
 
-    def __init__(self) -> None:
+    Parameters
+    ----------
+    instance_id : int
+        PX4 instance index.  Instance 0 uses topic prefix ``/px4_0``,
+        instance 1 uses ``/px4_1``, etc.  This matches the DDS namespace
+        set by ``PX4_UXRCE_DDS_NS=px4_<i>`` in ``launch_sim.sh``.
+    """
+
+    def __init__(self, instance_id: int = 0) -> None:
+        self._instance_id = instance_id
+        prefix = f"/px4_{instance_id}"
         super().__init__(
-            "px4_gz_gym_cmd",
+            f"px4_gz_gym_cmd_{instance_id}",
             parameter_overrides=[
                 rclpy.Parameter(
                     "use_sim_time",
@@ -100,7 +110,7 @@ class _PX4Cmd(Node):
         self._status: Optional[VehicleStatus] = None
         self.create_subscription(
             VehicleStatus,
-            "/fmu/out/vehicle_status_v1",
+            f"{prefix}/fmu/out/vehicle_status_v1",
             self._status_cb,
             _PX4_QOS,
         )
@@ -110,28 +120,28 @@ class _PX4Cmd(Node):
         # Offboard control-mode heartbeat  (SEPARATE from setpoints)
         self._offboard_mode_pub = self.create_publisher(
             OffboardControlMode,
-            "/fmu/in/offboard_control_mode",
+            f"{prefix}/fmu/in/offboard_control_mode",
             10,
         )
 
         # Trajectory setpoint  (position / velocity targets)
         self._setpoint_pub = self.create_publisher(
             TrajectorySetpoint,
-            "/fmu/in/trajectory_setpoint",
+            f"{prefix}/fmu/in/trajectory_setpoint",
             10,
         )
 
         # Attitude setpoint  (roll / pitch / thrust)
         self._attitude_pub = self.create_publisher(
             VehicleAttitudeSetpoint,
-            "/fmu/in/vehicle_attitude_setpoint_v1",
+            f"{prefix}/fmu/in/vehicle_attitude_setpoint_v1",
             10,
         )
 
         # Vehicle command  (arm, takeoff, mode-switch, land)
         self._cmd_pub = self.create_publisher(
             VehicleCommand,
-            "/fmu/in/vehicle_command",
+            f"{prefix}/fmu/in/vehicle_command",
             10,
         )
 
@@ -279,7 +289,7 @@ class _PX4Cmd(Node):
         msg.param5 = param5
         msg.param6 = param6
         msg.param7 = param7
-        msg.target_system = 1
+        msg.target_system = self._instance_id + 1  # MAV_SYS_ID = instance + 1
         msg.target_component = 1
         msg.source_system = 1
         msg.source_component = 1
@@ -335,44 +345,92 @@ class _PX4Cmd(Node):
 
 # ── Module-level singleton management ───────────────────────
 
+# ── Per-instance node registry ──────────────────────────────
+# Maps instance_id → (_PX4Cmd, spin_thread)
+_nodes: dict[int, _PX4Cmd] = {}
+_spin_threads: dict[int, threading.Thread] = {}
+# Legacy alias for single-instance use
 _node: Optional[_PX4Cmd] = None
 _spin_thread: Optional[threading.Thread] = None
 
 
-def _ensure_node() -> _PX4Cmd:
-    """Lazily create (and background-spin) the ROS 2 command node."""
+def _ensure_node(instance_id: int = 0) -> _PX4Cmd:
+    """Lazily create (and background-spin) the ROS 2 command node
+    for the given PX4 instance."""
     global _node, _spin_thread
-    if _node is not None:
-        return _node
+    if instance_id in _nodes:
+        return _nodes[instance_id]
 
     if not rclpy.ok():
         rclpy.init()
 
-    _node = _PX4Cmd()
+    node = _PX4Cmd(instance_id=instance_id)
+    _nodes[instance_id] = node
+
+    # Legacy alias for instance 0
+    if instance_id == 0:
+        _node = node
 
     # Spin in a daemon thread so callbacks (VehicleStatus, etc.) keep
     # arriving while the main thread is blocked in reset().
-    def _spin() -> None:
-        assert _node is not None
-        try:
-            rclpy.spin(_node)
-        except Exception:
-            pass
+    #
+    # For multi-instance we use a MultiThreadedExecutor so a single
+    # spin thread handles callbacks for all nodes.
+    # Only start the executor once (for the first node).
+    if not _spin_threads:
+        from rclpy.executors import MultiThreadedExecutor
 
-    _spin_thread = threading.Thread(target=_spin, daemon=True)
-    _spin_thread.start()
-    return _node
+        _executor = MultiThreadedExecutor()
+        _executor.add_node(node)
+
+        def _spin_all() -> None:
+            try:
+                _executor.spin()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_spin_all, daemon=True)
+        t.start()
+        _spin_threads[instance_id] = t
+        # Stash executor for adding future nodes
+        _ensure_node._executor = _executor  # type: ignore[attr-defined]
+    else:
+        # Add this node to the existing executor
+        executor = getattr(_ensure_node, "_executor", None)
+        if executor is not None:
+            executor.add_node(node)
+        _spin_threads[instance_id] = list(_spin_threads.values())[0]  # same thread
+
+    if instance_id == 0:
+        _spin_thread = list(_spin_threads.values())[0]
+
+    return node
 
 
 def shutdown_node() -> None:
-    """Destroy the singleton node (call at final env close)."""
+    """Destroy all nodes (call at final env close)."""
     global _node, _spin_thread
-    if _node is not None:
-        _node.destroy_node()
-        _node = None
-    if rclpy.ok():
-        rclpy.shutdown()
+    for node in _nodes.values():
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+    _nodes.clear()
+    _spin_threads.clear()
+    _node = None
     _spin_thread = None
+    executor = getattr(_ensure_node, "_executor", None)
+    if executor is not None:
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+        _ensure_node._executor = None  # type: ignore[attr-defined]
+    if rclpy.ok():
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════
@@ -380,15 +438,15 @@ def shutdown_node() -> None:
 # ════════════════════════════════════════════════════════════
 
 
-def clear_state() -> None:
+def clear_state(instance_id: int = 0) -> None:
     """Clear cached VehicleStatus so a fresh episode starts clean."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     node.reset_state()
 
 
-def wait_for_connection(timeout: float = 30.0) -> bool:
+def wait_for_connection(timeout: float = 30.0, instance_id: int = 0) -> bool:
     """Block until we receive at least one ``VehicleStatus`` from PX4."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         if node.connected:
@@ -404,6 +462,7 @@ def stream_setpoints_and_offboard(
     x: float = 0.0,
     y: float = 0.0,
     z_enu: float = 2.5,
+    instance_id: int = 0,
 ) -> None:
     """Publish *n* offboard-mode + setpoint pairs at *rate_hz*.
 
@@ -417,7 +476,7 @@ def stream_setpoints_and_offboard(
         Target altitude in ENU (positive-up).  Internally converted to
         NED for ``TrajectorySetpoint``.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     dt = 1.0 / rate_hz
     z_ned = -abs(z_enu)  # ENU → NED
     for _ in range(n):
@@ -430,6 +489,7 @@ def arm_and_takeoff(
     target_alt: float = 2.5,
     timeout: float = 20.0,
     get_altitude=None,
+    instance_id: int = 0,
 ) -> bool:
     """Arm in OFFBOARD mode and climb to *target_alt* via position setpoint.
 
@@ -454,7 +514,7 @@ def arm_and_takeoff(
 
     Returns True if arming succeeded.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     z_ned = -abs(target_alt)  # ENU → NED
 
     # Arm (retry a few times — PX4 may reject while still initialising).
@@ -486,14 +546,14 @@ def arm_and_takeoff(
     return True
 
 
-def switch_to_offboard(timeout: float = 10.0) -> bool:
+def switch_to_offboard(timeout: float = 10.0, instance_id: int = 0) -> bool:
     """Switch PX4 to OFFBOARD mode.
 
     Assumes ``OffboardControlMode`` has been streaming (see
     :func:`stream_setpoints_and_offboard`).  Retries until PX4
     reports ``nav_state == OFFBOARD``.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         if node.in_offboard:
@@ -512,6 +572,7 @@ def publish_offboard_heartbeat(
     x: float = 0.0,
     y: float = 0.0,
     z: float = 2.5,
+    instance_id: int = 0,
 ) -> None:
     """Publish an ``OffboardControlMode`` heartbeat to keep PX4 in
     OFFBOARD mode.
@@ -524,21 +585,21 @@ def publish_offboard_heartbeat(
     as a safety fallback — the RL policy's own setpoints (via
     ``_apply_action``) will override it within the same sim step.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     z_ned = -abs(z)
     node.publish_offboard_control_mode(position=True)
     node.publish_setpoint(x, y, z_ned)
 
 
-def force_disarm() -> None:
+def force_disarm(instance_id: int = 0) -> None:
     """Immediately force-disarm the vehicle (no landing)."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     node.disarm(force=True)
 
 
-def wait_for_disarm(timeout: float = 5.0) -> bool:
+def wait_for_disarm(timeout: float = 5.0, instance_id: int = 0) -> bool:
     """Block until PX4 reports disarmed."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         if not node.armed:
@@ -553,6 +614,7 @@ def publish_attitude_command(
     pitch: float = 0.0,
     yaw: float = 0.0,
     thrust: float = 0.5,
+    instance_id: int = 0,
 ) -> None:
     """Publish an attitude setpoint to PX4.
 
@@ -565,14 +627,17 @@ def publish_attitude_command(
         Desired Euler angles in radians (NED).
     thrust : float
         Normalised collective thrust ``[0, 1]``.
+    instance_id : int
+        PX4 instance index.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     node.publish_offboard_control_mode(attitude=True, position=False)
     node.publish_attitude_setpoint(roll, pitch, yaw, thrust)
 
 
 def publish_offboard_attitude_heartbeat(
     thrust: float = 0.5,
+    instance_id: int = 0,
 ) -> None:
     """Keep PX4 in OFFBOARD **attitude** mode.
 
@@ -581,7 +646,7 @@ def publish_offboard_attitude_heartbeat(
     The RL policy's own ``publish_attitude_command`` will override
     this within the same sim step.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     node.publish_offboard_control_mode(attitude=True, position=False)
     node.publish_attitude_setpoint(
         roll=0.0,
@@ -604,25 +669,26 @@ def publish_offboard_attitude_heartbeat(
 # ════════════════════════════════════════════════════════
 
 
-def is_connected() -> bool:
+def is_connected(instance_id: int = 0) -> bool:
     """True if at least one VehicleStatus has been received."""
-    return _ensure_node().connected
+    return _ensure_node(instance_id).connected
 
 
-def is_armed() -> bool:
+def is_armed(instance_id: int = 0) -> bool:
     """True if PX4 reports armed."""
-    return _ensure_node().armed
+    return _ensure_node(instance_id).armed
 
 
-def is_in_offboard() -> bool:
+def is_in_offboard(instance_id: int = 0) -> bool:
     """True if PX4 nav_state == OFFBOARD."""
-    return _ensure_node().in_offboard
+    return _ensure_node(instance_id).in_offboard
 
 
 def stepped_wait_for_connection(
     step_fn,
     steps_per_iter: int = 50,
     max_iters: int = 300,
+    instance_id: int = 0,
 ) -> bool:
     """Wait for PX4 DDS connection by stepping the sim forward.
 
@@ -630,7 +696,7 @@ def stepped_wait_for_connection(
     sim-time at 0.004 s step size) instead of wall-clock sleeping.
     Total max wait: 300 × 50 × 0.004 = 60 s sim-time.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     for _ in range(max_iters):
         if node.connected:
             return True
@@ -645,6 +711,7 @@ def stepped_stream_setpoints(
     sim_seconds: float = 2.0,
     ticks_per_publish: int = 5,
     step_size: float = 0.004,
+    instance_id: int = 0,
 ) -> None:
     """Stream OffboardControlMode + position setpoints while stepping.
 
@@ -656,7 +723,7 @@ def stepped_stream_setpoints(
     With defaults: 2.0 s / (5 × 0.004) = 100 publishes, each
     separated by 5 physics steps.  Wall-clock: ~0.1 s.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     z_ned = -abs(z_enu)
     n_publishes = int(sim_seconds / (ticks_per_publish * step_size))
     for _ in range(n_publishes):
@@ -671,6 +738,7 @@ def stepped_switch_to_offboard(
     ticks_per_publish: int = 5,
     max_sim_seconds: float = 10.0,
     step_size: float = 0.004,
+    instance_id: int = 0,
 ) -> bool:
     """Switch to OFFBOARD mode, stepping sim between retries.
 
@@ -678,7 +746,7 @@ def stepped_switch_to_offboard(
     steps) to avoid PX4's offboard timeout, and sends the mode-switch
     command every 0.2 s of sim-time.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     z_ned = -abs(z_enu)
     max_iters = int(max_sim_seconds / (ticks_per_publish * step_size))
     mode_cmd_interval = max(1, int(0.2 / (ticks_per_publish * step_size)))
@@ -702,6 +770,7 @@ def stepped_arm_and_takeoff(
     step_size: float = 0.004,
     arm_timeout_s: float = 10.0,
     climb_timeout_s: float = 20.0,
+    instance_id: int = 0,
 ) -> bool:
     """Arm and fly to *target_alt* using sim-stepping.
 
@@ -724,7 +793,7 @@ def stepped_arm_and_takeoff(
     climb_timeout_s : float
         Max sim-time seconds to wait for altitude.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     z_ned = -abs(target_alt)
     dt_per_iter = ticks_per_publish * step_size  # 0.02 s default
 
@@ -764,6 +833,7 @@ def stepped_stream_attitude(
     ticks_per_publish: int = 5,
     step_size: float = 0.004,
     hover_thrust: float = 0.5,
+    instance_id: int = 0,
 ) -> None:
     """Stream **attitude-mode** offboard heartbeats while stepping.
 
@@ -771,12 +841,15 @@ def stepped_stream_attitude(
     ``VehicleAttitudeSetpoint`` (level, hover thrust) at 50 Hz.
     PX4 needs ≥ 2 Hz for ≥ 2 s sim-time before it accepts OFFBOARD.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     n_publishes = int(sim_seconds / (ticks_per_publish * step_size))
     for _ in range(n_publishes):
         node.publish_offboard_control_mode(attitude=True, position=False)
         node.publish_attitude_setpoint(
-            roll=0.0, pitch=0.0, yaw=0.0, thrust=hover_thrust,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            thrust=hover_thrust,
         )
         step_fn(ticks_per_publish)
 
@@ -788,6 +861,7 @@ def stepped_offboard_arm(
     offboard_timeout_s: float = 10.0,
     arm_timeout_s: float = 10.0,
     hover_thrust: float = 0.5,
+    instance_id: int = 0,
 ) -> bool:
     """Switch to OFFBOARD **attitude** mode and arm.
 
@@ -797,13 +871,16 @@ def stepped_offboard_arm(
 
     Returns True if both offboard switch and arming succeeded.
     """
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     dt_per_iter = ticks_per_publish * step_size
 
     def _publish_attitude_heartbeat() -> None:
         node.publish_offboard_control_mode(attitude=True, position=False)
         node.publish_attitude_setpoint(
-            roll=0.0, pitch=0.0, yaw=0.0, thrust=hover_thrust,
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            thrust=hover_thrust,
         )
 
     # ── Switch to OFFBOARD ──────────────────────────────────
@@ -843,9 +920,10 @@ def stepped_wait_for_disarm(
     step_fn,
     steps_per_iter: int = 50,
     max_iters: int = 50,
+    instance_id: int = 0,
 ) -> bool:
     """Wait for PX4 to disarm by stepping sim forward."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     for _ in range(max_iters):
         if not node.armed:
             return True
@@ -854,9 +932,9 @@ def stepped_wait_for_disarm(
     return not node.armed
 
 
-def land_and_disarm(timeout: float = 15.0) -> bool:
+def land_and_disarm(timeout: float = 15.0, instance_id: int = 0) -> bool:
     """Switch to AUTO.LAND and wait for disarm (best-effort)."""
-    node = _ensure_node()
+    node = _ensure_node(instance_id)
     node.set_mode_auto_land()
     node.land()
     t0 = time.monotonic()
