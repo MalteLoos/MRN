@@ -630,6 +630,7 @@ def nsh_command(
         tmux target pane (``session:window.pane``).
     """
     import subprocess as _sp
+
     _sp.run(
         ["tmux", "send-keys", "-t", tmux_target, cmd, "Enter"],
         check=False,
@@ -650,4 +651,47 @@ def restart_ekf2(
     nsh_command("ekf2 stop", tmux_target=tmux_target)
     time.sleep(settle_time)
     nsh_command("ekf2 start", tmux_target=tmux_target)
+    time.sleep(settle_time)
+
+
+def restart_px4(
+    tmux_target: str = "px4sim:sim.1",
+    settle_time: float = 0.1,
+) -> None:
+    """Stop and restart all key PX4 modules for a clean episode.
+
+    Unlike ``restart_ekf2`` which only wipes the estimator, this
+    stops and restarts **every** module that accumulates state
+    between episodes: estimator, commander, controllers, navigator,
+    etc.  Gazebo is unaffected — only PX4-internal modules are
+    cycled.
+
+    Call this during ``env.reset()`` after teleporting the drone.
+    """
+    # Modules listed in dependency order (stop in reverse,
+    # start in forward order).
+    modules = [
+        "flight_mode_manager",
+        # "navigator",
+        # "mc_pos_control",
+        # "mc_att_control",
+        # "mc_rate_control",
+        # "mc_hover_thrust_estimator",
+        # "land_detector",
+        # "commander",
+        "ekf2",
+    ]
+
+    # ── Stop all modules ────────────────────────────────────
+    for mod in modules:
+        nsh_command(f"{mod} stop", tmux_target=tmux_target)
+        time.sleep(0.1)
+
+    time.sleep(settle_time)
+
+    # ── Start all modules (reverse order) ───────────────────
+    for mod in reversed(modules):
+        nsh_command(f"{mod} start", tmux_target=tmux_target)
+        time.sleep(0.1)
+
     time.sleep(settle_time)

@@ -14,9 +14,9 @@ uploaded during training — call ``wandb sync <run_dir>`` afterwards.
 
 Usage
 -----
-    python src/train_hover.py                              # defaults
-    python src/train_hover.py --epochs 500 --device cuda   # custom
-    python src/train_hover.py --resume runs/hover/ckpt_100.pt
+    python3 src/train_hover.py                              # defaults
+    python3 src/train_hover.py --epochs 500 --device cuda   # custom
+    python3 src/train_hover.py --resume runs/hover/ckpt_100.pt
 """
 
 from __future__ import annotations
