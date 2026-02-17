@@ -59,6 +59,91 @@ from px4_gz_gym.sensors import GzSensors  # noqa: E402
 from px4_gz_gym import px4_cmd  # noqa: E402
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Lightweight profiler for hot-path timing
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class StepProfiler:
+    """Accumulate wall-clock timings and print a summary periodically.
+
+    Usage::
+
+        prof = StepProfiler(print_every=200)
+        with prof.measure("gz_step"):
+            ...
+        prof.tick()          # call once per env.step()
+    """
+
+    def __init__(self, print_every: int = 200) -> None:
+        self._print_every = print_every
+        self._counts: dict[str, int] = {}
+        self._totals: dict[str, float] = {}
+        self._ticks = 0
+        self._epoch_t0 = time.monotonic()
+
+    class _Timer:
+        __slots__ = ("_prof", "_label", "_t0")
+
+        def __init__(self, prof: "StepProfiler", label: str) -> None:
+            self._prof = prof
+            self._label = label
+            self._t0 = 0.0
+
+        def __enter__(self) -> "StepProfiler._Timer":
+            self._t0 = time.monotonic()
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            dt = time.monotonic() - self._t0
+            p = self._prof
+            p._totals[self._label] = p._totals.get(self._label, 0.0) + dt
+            p._counts[self._label] = p._counts.get(self._label, 0) + 1
+
+    def measure(self, label: str) -> _Timer:
+        return self._Timer(self, label)
+
+    def tick(self) -> None:
+        self._ticks += 1
+        if self._ticks % self._print_every == 0:
+            self._print_and_reset()
+
+    def force_print(self, header: str = "") -> None:
+        self._print_and_reset(header=header)
+
+    def _print_and_reset(self, header: str = "") -> None:
+        wall = time.monotonic() - self._epoch_t0
+        hdr = header or f"⏱  StepProfiler  ({self._ticks} ticks, {wall:.2f}s wall)"
+        lines = [hdr, "-" * len(hdr)]
+        for label in sorted(self._totals, key=lambda k: -self._totals[k]):
+            total = self._totals[label]
+            count = self._counts[label]
+            avg_ms = total / count * 1000 if count else 0
+            pct = total / wall * 100 if wall > 0 else 0
+            lines.append(
+                f"  {label:<28s}  "
+                f"{total:8.3f}s  "
+                f"{count:6d}×  "
+                f"avg {avg_ms:7.2f}ms  "
+                f"({pct:5.1f}%)"
+            )
+        accounted = sum(self._totals.values())
+        other = wall - accounted
+        if wall > 0:
+            lines.append(
+                f"  {'(unaccounted)':<28s}  "
+                f"{other:8.3f}s  "
+                f"{'':>6s}   "
+                f"{'':>11s}  "
+                f"({other / wall * 100:5.1f}%)"
+            )
+        print("\n".join(lines))
+        print()
+        self._totals.clear()
+        self._counts.clear()
+        self._epoch_t0 = time.monotonic()
+
+
 class PX4GazeboEnv(gym.Env):
     """
     Gymnasium env wrapping PX4-SITL + Gazebo Harmonic with deterministic
@@ -210,6 +295,7 @@ class PX4GazeboEnv(gym.Env):
 
         # ── bookkeeping ─────────────────────────────────────
         self._step_count: int = 0
+        self.profiler = StepProfiler(print_every=200)
 
     # ════════════════════════════════════════════════════════
     #  Gymnasium API
@@ -223,6 +309,9 @@ class PX4GazeboEnv(gym.Env):
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         super().reset(seed=seed)
 
+        _prof = self.profiler
+        _reset_t0 = time.monotonic()
+
         # Helper: advance sim by n physics steps deterministically.
         # All reset waiting is done through this instead of
         # time.sleep(), turning ~130 s wall-clock into ~2-5 s.
@@ -230,72 +319,88 @@ class PX4GazeboEnv(gym.Env):
             return self._gz.step_and_wait(n, step_size=self.step_size)
 
         # ── 1. Force-disarm (sim-stepped wait) ──────────────
-        px4_cmd.force_disarm()
-        px4_cmd.stepped_wait_for_disarm(
-            _step, steps_per_iter=50, max_iters=50,
-        )
+        with _prof.measure("reset/1_disarm"):
+            px4_cmd.force_disarm()
+            px4_cmd.stepped_wait_for_disarm(
+                _step,
+                steps_per_iter=100,
+                max_iters=25,
+            )
 
-        # ── 2. Teleport to spawn pose (unpaused) ────────────
-        #    set_model_pose only updates position/orientation; it does
-        #    NOT zero linear/angular velocities.  Repeatedly slam
-        #    the pose back while the sim runs freely so the physics
-        #    solver damps out all residual velocity.
-        self._gz.unpause()
-        _spawn_pos = (0.0, 0.0, 0.0)
-        _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
-        for _ in range(10):
+        # ── 2. Teleport to spawn pose (paused, fast path) ──
+        #    Uses the persistent helper subprocess for set_pose
+        #    (< 1 ms per call vs ~260 ms CLI).  Slam pose twice
+        #    while paused, then step physics to let the solver
+        #    damp out residual velocity.  No time.sleep needed.
+        with _prof.measure("reset/2_teleport"):
+            _spawn_pos = (0.0, 0.0, 0.0)
+            _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
+            # Set pose while paused — two calls to be safe
             self._gz.set_model_pose(
                 self.model_name,
                 position=_spawn_pos,
                 orientation=_spawn_ori,
             )
-            time.sleep(0.02)
-        self._gz.pause()
+            # Step 25 physics steps (0.1s sim-time) to let
+            # the physics solver damp residual velocities
+            _step(25)
+            # Slam pose again after damping to correct any drift
+            self._gz.set_model_pose(
+                self.model_name,
+                position=_spawn_pos,
+                orientation=_spawn_ori,
+            )
+            # Final damping: 25 more steps
+            _step(25)
 
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
-        #    Sleeps inside are minimal (~20 ms for tmux delivery).
-        #    Actual convergence time is provided by sim-stepping below.
-        px4_cmd.restart_px4()
+        with _prof.measure("reset/3_restart_px4"):
+            px4_cmd.restart_px4()
 
         # Give PX4 modules sim-time to re-initialise.
-        # 500 steps = 2 s sim-time — enough for EKF2 to converge
-        # on the new pose.  Wall-clock: ~0.1 s.
-        _step(500)
+        # 250 steps = 1 s sim-time — enough for EKF2 to converge.
+        with _prof.measure("reset/4_ekf_converge"):
+            _step(250)
 
         # ── 4. Clear sensor buffers for fresh episode ───────
         self._sensors.clear_imu_buffer()
         self._sensors.clear_trajectory()
 
         # ── 5. Wait for PX4 DDS connection (sim-stepped) ───
-        px4_cmd.clear_state()
-        px4_cmd.stepped_wait_for_connection(
-            _step, steps_per_iter=50, max_iters=300,
-        )
+        with _prof.measure("reset/5_dds_connect"):
+            px4_cmd.clear_state()
+            px4_cmd.stepped_wait_for_connection(
+                _step,
+                steps_per_iter=100,
+                max_iters=150,
+            )
 
         # ── 6. Stream attitude-mode offboard heartbeats ────
-        #    PX4 needs OffboardControlMode at ≥ 2 Hz for ≥ 2 s
-        #    of sim-time before accepting OFFBOARD.  We stream
-        #    in **attitude** mode so the policy can control the
-        #    drone from the ground up (no position controller).
-        px4_cmd.stepped_stream_attitude(
-            _step,
-            sim_seconds=2.0,
-            ticks_per_publish=self.n_gz_steps,
-            step_size=self.step_size,
-        )
+        #    PX4 needs OffboardControlMode at >= 2 Hz for >= 1 s.
+        #    1.5 s sim-time gives margin.
+        with _prof.measure("reset/6_offboard_stream"):
+            px4_cmd.stepped_stream_attitude(
+                _step,
+                sim_seconds=1.5,
+                ticks_per_publish=self.n_gz_steps,
+                step_size=self.step_size,
+            )
 
         # ── 7. Switch to OFFBOARD + arm (attitude mode) ────
-        #    No climb phase — the policy takes over from ground.
-        px4_cmd.stepped_offboard_arm(
-            _step,
-            ticks_per_publish=self.n_gz_steps,
-            step_size=self.step_size,
-            offboard_timeout_s=10.0,
-            arm_timeout_s=10.0,
-        )
+        with _prof.measure("reset/7_arm"):
+            px4_cmd.stepped_offboard_arm(
+                _step,
+                ticks_per_publish=self.n_gz_steps,
+                step_size=self.step_size,
+                offboard_timeout_s=5.0,
+                arm_timeout_s=5.0,
+            )
 
         # ── 9. Pause again for deterministic stepping ──────
         self._gz.pause()
+
+        _reset_wall = time.monotonic() - _reset_t0
+        print(f"  ⏱  reset() total: {_reset_wall:.2f}s")
 
         self._step_count = 0
         obs = self._sensors.get_obs()
@@ -321,21 +426,22 @@ class PX4GazeboEnv(gym.Env):
         observation dict.
         """
         action = np.asarray(action, dtype=np.float32)
+        _prof = self.profiler
 
         # 1. Apply action → PX4 attitude setpoint ───────────
-        #    publish_attitude_command() already sends both the
-        #    OffboardControlMode heartbeat AND the attitude setpoint,
-        #    so no separate heartbeat is needed here.
-        self._apply_action(action)
+        with _prof.measure("step/1_apply_action"):
+            self._apply_action(action)
 
         # 2. Step Gazebo ─────────────────────────────────────
-        sim_time = self._gz.step_and_wait(
-            n=self.n_gz_steps,
-            step_size=self.step_size,
-        )
+        with _prof.measure("step/2_gz_step_wait"):
+            sim_time = self._gz.step_and_wait(
+                n=self.n_gz_steps,
+                step_size=self.step_size,
+            )
 
         # 3. Observe (IMU averaged, camera latest) ──────────
-        obs = self._sensors.get_obs()
+        with _prof.measure("step/3_get_obs"):
+            obs = self._sensors.get_obs()
 
         # 4. Reward / termination ────────────────────────────
         reward = self._compute_reward(obs, action)
@@ -344,6 +450,7 @@ class PX4GazeboEnv(gym.Env):
         truncated = self._step_count >= self.max_episode_steps
 
         info = self._build_info(sim_time=sim_time)
+        _prof.tick()
         return obs, reward, terminated, truncated, info
 
     def close(self) -> None:

@@ -111,6 +111,9 @@ class GzSensors:
         # ── Camera ──────────────────────────────────────────
         self._camera_raw: np.ndarray | None = None  # full-res RGB
         self._camera_raw_hw: tuple[int, int] = (0, 0)
+        self._camera_new: bool = False  # True when a new frame arrived
+        self._camera_obs_cache: np.ndarray | None = None  # cached resize
+        self._camera_full_cache: np.ndarray | None = None  # cached copy
 
         # ── Trajectory history for RViz ─────────────────────
         self._trajectory: list[list[float]] = []
@@ -232,14 +235,23 @@ class GzSensors:
                     ]
                 ).astype(np.float32)
 
-            # ── Camera: down-scale for obs ──────────────────
+            # ── Camera: down-scale for obs (cached) ────────
             if self._camera_raw is not None:
-                cam_full = self._camera_raw.copy()
-                cam_obs = cv2.resize(
-                    cam_full,
-                    (self.cam_obs_width, self.cam_obs_height),
-                    interpolation=cv2.INTER_AREA,
-                )
+                if self._camera_new or self._camera_obs_cache is None:
+                    # New frame arrived — resize and cache
+                    cam_full = self._camera_raw.copy()
+                    cam_obs = cv2.resize(
+                        cam_full,
+                        (self.cam_obs_width, self.cam_obs_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    self._camera_obs_cache = cam_obs
+                    self._camera_full_cache = cam_full
+                    self._camera_new = False
+                else:
+                    # Reuse cached resize (camera ~30 Hz, env ~50 Hz)
+                    cam_obs = self._camera_obs_cache
+                    cam_full = self._camera_full_cache
             else:
                 cam_full = None
                 cam_obs = np.zeros(
@@ -349,6 +361,7 @@ class GzSensors:
         with self._lock:
             self._camera_raw = img
             self._camera_raw_hw = (h, w)
+            self._camera_new = True
 
     def _on_pose_v(self, msg: Pose_V) -> None:
         """Fallback — extract our model from the ``Pose_V`` bundle."""

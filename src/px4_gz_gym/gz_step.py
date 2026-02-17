@@ -153,28 +153,73 @@ class GzStepController:
         expected = t_before + n * step_size - 1e-9
 
         self._clock_event.clear()
+        _t0 = time.monotonic()
         self.step(n)
 
         # Spin until the clock confirms the expected sim-time.
         # The _clock_event is set by _on_clock whenever sim-time
-        # advances.  We must check sim_time *before* clearing the
-        # event to avoid a race where the signal arrives between
-        # the clear and the check.
+        # advances.
+        #
+        # Flow:  clear → check → wait → check → clear → ...
+        # We clear *before* waiting so that a signal arriving between
+        # the check and the wait is not lost (the event stays set and
+        # the wait returns immediately).
+        _polls = 0
         deadline = time.monotonic() + wall_timeout
         while time.monotonic() < deadline:
-            # 1) Check first — the callback may already have fired.
+            # 1) Check — the callback may already have fired.
             if self.sim_time >= expected:
+                self._record_poll_stats(n, _polls, time.monotonic() - _t0)
                 return self.sim_time
-            # 2) Wait for the next clock update.
-            self._clock_event.wait(timeout=0.05)
-            # 3) Check *again* before clearing so we never lose
-            #    a signal that arrived while we were checking.
-            if self.sim_time >= expected:
-                return self.sim_time
+            # 2) Clear *before* waiting so any signal that arrives
+            #    between here and the .wait() is not lost.
             self._clock_event.clear()
+            # 3) Re-check after clear to avoid TOCTOU race.
+            if self.sim_time >= expected:
+                self._record_poll_stats(n, _polls, time.monotonic() - _t0)
+                return self.sim_time
+            # 4) Wait for the next clock update (1 ms — was 50 ms).
+            self._clock_event.wait(timeout=0.001)
+            _polls += 1
 
         # Timed out – return whatever we have
+        self._record_poll_stats(n, _polls, time.monotonic() - _t0, timed_out=True)
         return self.sim_time
+
+    # ── poll stats (lightweight profiling) ──────────────
+    _poll_total_calls: int = 0
+    _poll_total_iters: int = 0
+    _poll_total_wall: float = 0.0
+    _poll_max_wall: float = 0.0
+    _poll_timeouts: int = 0
+    _POLL_PRINT_EVERY: int = 200
+
+    def _record_poll_stats(
+        self, n: int, polls: int, wall: float, timed_out: bool = False
+    ) -> None:
+        self._poll_total_calls += 1
+        self._poll_total_iters += polls
+        self._poll_total_wall += wall
+        if wall > self._poll_max_wall:
+            self._poll_max_wall = wall
+        if timed_out:
+            self._poll_timeouts += 1
+        if self._poll_total_calls % self._POLL_PRINT_EVERY == 0:
+            avg_ms = self._poll_total_wall / self._poll_total_calls * 1000
+            avg_polls = self._poll_total_iters / self._poll_total_calls
+            print(
+                f"  ⏱  step_and_wait stats ({self._poll_total_calls} calls):  "
+                f"avg {avg_ms:.2f}ms  "
+                f"max {self._poll_max_wall * 1000:.2f}ms  "
+                f"avg_polls {avg_polls:.1f}  "
+                f"timeouts {self._poll_timeouts}"
+            )
+            # reset for next window
+            self._poll_total_calls = 0
+            self._poll_total_iters = 0
+            self._poll_total_wall = 0.0
+            self._poll_max_wall = 0.0
+            self._poll_timeouts = 0
 
     def reset_world(self) -> bool:
         """Pause the simulation and reset the cached clock.
@@ -298,8 +343,8 @@ class GzStepController:
     ) -> bool:
         """Teleport *model_name* to the given pose.
 
-        Uses ``/world/<world>/set_pose`` (``gz.msgs.Pose``).
-        The model must already exist in the world.
+        Uses the persistent helper subprocess (< 1 ms) if available,
+        otherwise falls back to a blocking ``gz service`` CLI call.
 
         Parameters
         ----------
@@ -310,6 +355,16 @@ class GzStepController:
         orientation : tuple
             ``(w, x, y, z)`` quaternion.
         """
+        # Try fast path via persistent helper subprocess
+        cmd = (
+            f"POSE {model_name} "
+            f"{position[0]} {position[1]} {position[2]} "
+            f"{orientation[0]} {orientation[1]} {orientation[2]} {orientation[3]}"
+        )
+        if self._helper_send(cmd):
+            return True
+
+        # Fallback: slow CLI path
         svc = f"/world/{self.world_name}/set_pose"
         req_text = (
             f'name: "{model_name}", '

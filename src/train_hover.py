@@ -361,7 +361,21 @@ def collect_rollout(
     """
     buffer.reset()
     agent.reset_vision()
+
+    # Timing accumulators for rollout profiling
+    _t_reset = 0.0
+    _t_policy = 0.0
+    _t_env_step = 0.0
+    _t_vision = 0.0
+    _t_misc = 0.0
+    _n_resets = 0
+    _n_vision = 0
+    _rollout_t0 = time.time()
+
+    _t0 = time.time()
     obs = env.reset()
+    _t_reset += time.time() - _t0
+    _n_resets += 1
 
     # Set a trivial hover route (2 waypoints at the target hover position)
     hover_pos: Tuple[float, float, float] = (0.0, 0.0, env.hover_alt)
@@ -375,7 +389,10 @@ def collect_rollout(
     for _ in range(rollout_steps):
         # ── slow path: update vision on new camera frame ──────────
         if obs.get("new_frame", False) and "cam" in obs:
+            _tv0 = time.time()
             agent.update_vision(obs)
+            _t_vision += time.time() - _tv0
+            _n_vision += 1
 
         # ── prepare fast-path tensors ─────────────────────────────
         imu = obs["imu"]
@@ -405,11 +422,15 @@ def collect_rollout(
             "waypoints": wp_tensor,
             "vis_feat": vis_feat,
         }
+        _tp0 = time.time()
         action, log_prob, value = agent.policy.act(policy_obs)
+        _t_policy += time.time() - _tp0
         action_sq = action.squeeze(0)
 
         # ── environment step ──────────────────────────────────────
+        _te0 = time.time()
         next_obs, reward, done, info = env.step(action_sq.cpu())
+        _t_env_step += time.time() - _te0
 
         # ── store transition ──────────────────────────────────────
         buffer.store(
@@ -425,13 +446,44 @@ def collect_rollout(
         total_reward += float(reward)
 
         if done:
+            _tr0 = time.time()
             obs = env.reset()
+            _t_reset += time.time() - _tr0
+            _n_resets += 1
             agent.reset_vision()
             hover_pos = (0.0, 0.0, env.hover_alt)
             agent.set_route([hover_pos, hover_pos])
             episodes += 1
         else:
             obs = next_obs
+
+    # ── rollout profiling summary ─────────────────────────────────
+    _rollout_wall = time.time() - _rollout_t0
+    _t_other = _rollout_wall - _t_reset - _t_policy - _t_env_step - _t_vision
+    print(f"\n⏱  Rollout profiling  ({rollout_steps} steps, {_rollout_wall:.2f}s wall)")
+    print(
+        f"  {'env.step()':<24s}  {_t_env_step:8.3f}s  ({_t_env_step/_rollout_wall*100:5.1f}%)  {rollout_steps}×  avg {_t_env_step/rollout_steps*1000:.2f}ms"
+    )
+    print(
+        f"  {'env.reset()':<24s}  {_t_reset:8.3f}s  ({_t_reset/_rollout_wall*100:5.1f}%)  {_n_resets}×  avg {_t_reset/max(_n_resets,1)*1000:.1f}ms"
+    )
+    print(
+        f"  {'policy.act()':<24s}  {_t_policy:8.3f}s  ({_t_policy/_rollout_wall*100:5.1f}%)  {rollout_steps}×  avg {_t_policy/rollout_steps*1000:.2f}ms"
+    )
+    print(
+        f"  {'update_vision (RAFT)':<24s}  {_t_vision:8.3f}s  ({_t_vision/_rollout_wall*100:5.1f}%)  {_n_vision}×  avg {_t_vision/max(_n_vision,1)*1000:.2f}ms"
+    )
+    print(
+        f"  {'(other/overhead)':<24s}  {_t_other:8.3f}s  ({_t_other/_rollout_wall*100:5.1f}%)"
+    )
+    print()
+    # Also print the env-internal profiler (step sub-phases + reset phases)
+    _inner_env = getattr(env, "env", None)
+    _prof = getattr(_inner_env, "profiler", None)
+    if _prof is not None:
+        _prof.force_print(
+            header=f"⏱  Env profiler  ({rollout_steps} steps, {_rollout_wall:.2f}s wall)"
+        )
 
     # ── bootstrap last value ──────────────────────────────────────
     imu = obs["imu"]
