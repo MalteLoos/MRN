@@ -235,13 +235,23 @@ class PX4GazeboEnv(gym.Env):
         )
 
         # ── 2. Pause & teleport to spawn pose ──────────────
+        #    set_model_pose only updates position/orientation; it does
+        #    NOT zero linear/angular velocities.  Residual angular
+        #    velocity from the previous episode causes the drone to
+        #    tumble into random orientations during the settle phase.
+        #    Fix: repeatedly slam the pose back to identity over
+        #    several short step bursts so the physics solver damps
+        #    out all residual velocity.
         self._gz.pause()
-        self._gz.set_model_pose(
-            self.model_name,
-            position=(0.0, 0.0, 0.0),
-            orientation=(1.0, 0.0, 0.0, 0.0),
-        )
-        _step(50)  # settle physics
+        _spawn_pos = (0.0, 0.0, 0.0)
+        _spawn_ori = (1.0, 0.0, 0.0, 0.0)  # identity quaternion
+        for _ in range(10):
+            self._gz.set_model_pose(
+                self.model_name,
+                position=_spawn_pos,
+                orientation=_spawn_ori,
+            )
+            _step(5)  # 5 × 10 = 50 total settle steps
 
         # ── 3. Restart PX4 modules (EKF2, flight_mode_manager)
         #    Sleeps inside are minimal (~20 ms for tmux delivery).
