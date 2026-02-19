@@ -330,19 +330,48 @@ class DummyHoverEnv:
     def _reward(self, obs, action):
         pos = obs["drone_pos"]
         vel = obs["velocity"]
-        # Linear altitude error, capped — matches HoverEnvWrapper
+
+        # altitude error — linear with soft clamp (matches HoverEnvWrapper)
         raw_alt_err = abs(float(pos[2]) - self.hover_alt)
-        alt_err = min(raw_alt_err, 3.0)
+        alt_err = min(raw_alt_err, 5.0)
+
+        # horizontal drift from origin
         horiz = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
+
+        # velocity penalty
         speed = float(np.linalg.norm(vel))
+
+        # action penalty (exclude thrust)
         act_mag = float(np.sum(action[:3] ** 2))
+
+        # low-thrust penalty
         thrust = float(action[3] + 1.0) / 2.0
-        low_thrust_penalty = max(0.0, 0.35 - thrust) * 5.0
-        # Tilt penalty (dummy is always upright → 0)
+        low_thrust_penalty = max(0.0, 0.4 - thrust) * 5.0
+
+        # tilt penalty
         q = obs["drone_quat"]
-        qx, qy = float(q[1]), float(q[2])
+        qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
         cos_tilt = 1.0 - 2.0 * (qx**2 + qy**2)
         tilt_penalty = 1.0 - cos_tilt
+
+        # "don't dig deeper" penalty (matches HoverEnvWrapper)
+        TILT_THRESH_RAD = math.radians(15.0)
+        roll_angle = math.atan2(
+            2.0 * (qw * qx + qy * qz),
+            1.0 - 2.0 * (qx**2 + qy**2),
+        )
+        pitch_angle = math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx))))
+
+        same_dir_penalty = 0.0
+        if abs(roll_angle) > TILT_THRESH_RAD:
+            overlap = float(action[0]) * roll_angle
+            if overlap > 0:
+                same_dir_penalty += overlap * 3.0
+        if abs(pitch_angle) > TILT_THRESH_RAD:
+            overlap = float(action[1]) * pitch_angle
+            if overlap > 0:
+                same_dir_penalty += overlap * 3.0
+
         return (
             -1.5 * alt_err
             - 0.5 * horiz
@@ -350,6 +379,7 @@ class DummyHoverEnv:
             - 0.05 * act_mag
             - low_thrust_penalty
             - 0.8 * tilt_penalty
+            - same_dir_penalty
             + 0.5
         )
 
@@ -871,12 +901,16 @@ def collect_rollout(
     buffer: RolloutBuffer,
     rollout_steps: int,
     cfg: ModelConfig,
+    expert: ExpertHoverPolicy | None = None,
 ) -> dict[str, float]:
     """
     Collect ``rollout_steps`` transitions from a **single** env.
 
     Handles the dual-rate update: vision is only updated when the env
     signals ``new_frame``; the fast path runs every tick.
+
+    If *expert* is provided, the expert's action for each observation
+    is computed and stored in the buffer for the BC auxiliary loss.
     """
     buffer.reset()
     agent.reset_vision()
@@ -895,6 +929,8 @@ def collect_rollout(
     obs = env.reset()
     _t_reset += time.time() - _t0
     _n_resets += 1
+    if expert is not None:
+        expert.reset()
 
     # Set a trivial hover route (2 waypoints at the target hover position)
     hover_pos: Tuple[float, float, float] = (0.0, 0.0, env.hover_alt)
@@ -964,6 +1000,11 @@ def collect_rollout(
             if pre_hidden is not None
             else None
         )
+        # Compute expert action for BC auxiliary loss
+        expert_act_t: torch.Tensor | None = None
+        if expert is not None:
+            ea = expert.compute_action(obs)  # (4,) numpy, no noise
+            expert_act_t = torch.as_tensor(ea, dtype=torch.float32).to(device)
         buffer.store(
             imu=imu,
             waypoints=wp_tensor.squeeze(0),
@@ -975,6 +1016,7 @@ def collect_rollout(
             done=done,
             hidden=hidden_flat,
             flow=flow.squeeze(0) if flow is not None else None,
+            expert_action=expert_act_t,
         )
         total_reward += float(reward)
 
@@ -984,6 +1026,8 @@ def collect_rollout(
             _t_reset += time.time() - _tr0
             _n_resets += 1
             agent.reset_vision()
+            if expert is not None:
+                expert.reset()
             hover_pos = (0.0, 0.0, env.hover_alt)
             agent.set_route([hover_pos, hover_pos])
             episodes += 1
@@ -1058,6 +1102,7 @@ def collect_rollout_vec(
     rollout_steps: int,
     cfg: ModelConfig,
     hover_alt: float = 2.5,
+    expert: ExpertHoverPolicy | None = None,
 ) -> dict[str, float]:
     """Collect transitions from **N parallel envs** round-robin.
 
@@ -1067,6 +1112,11 @@ def collect_rollout_vec(
 
     The buffer must be sized for ``rollout_steps`` total transitions
     (spread across all envs).
+
+    If *expert* is provided, the expert's action for each observation
+    is computed and stored in the buffer for the BC auxiliary loss.
+    Each env gets its own expert instance (so controller state is
+    independent).
 
     Determinism
     ~~~~~~~~~~~
@@ -1100,6 +1150,16 @@ def collect_rollout_vec(
         }
 
     obs_per_env = [_remap(o) for o in obs_list]
+
+    # Per-env expert instances for BC auxiliary actions
+    experts_per_env: list[ExpertHoverPolicy | None] = []
+    if expert is not None:
+        for _ in range(num_envs):
+            e = ExpertHoverPolicy(hover_alt=hover_alt, noise_std=0.0)
+            e.reset()
+            experts_per_env.append(e)
+    else:
+        experts_per_env = [None] * num_envs
 
     # Set hover route for agent — target is directly above spawn
     hover_pos: Tuple[float, float, float] = (0.0, 0.0, hover_alt)
@@ -1206,6 +1266,13 @@ def collect_rollout_vec(
                 done = bool(term or trunc)
                 next_obs_raw = obs_raw
 
+            # Compute expert action for BC auxiliary loss
+            expert_act_t: torch.Tensor | None = None
+            ei = experts_per_env[i]
+            if ei is not None:
+                ea = ei.compute_action(obs_per_env[i])
+                expert_act_t = torch.as_tensor(ea, dtype=torch.float32).to(device)
+
             buffer.store(
                 imu=imus[i],
                 waypoints=wp_tensors[i],
@@ -1217,6 +1284,7 @@ def collect_rollout_vec(
                 done=done,
                 hidden=hidden_flats[i],
                 flow=flows[i],
+                expert_action=expert_act_t,
             )
             total_reward += float(reward)
             steps_collected += 1
@@ -1232,6 +1300,9 @@ def collect_rollout_vec(
                 agent.reset_vision()
                 hover_pos = (0.0, 0.0, hover_alt)
                 agent.set_route([hover_pos, hover_pos])
+                ei_done = experts_per_env[i]
+                if ei_done is not None:
+                    ei_done.reset()
                 episodes += 1
             else:
                 obs_per_env[i] = _remap(next_obs_raw)
@@ -1278,22 +1349,17 @@ def ppo_update(
     ppo_epochs: int,
     batch_size: int,
     scaler: torch.amp.GradScaler | None = None,  # type: ignore[attr-defined]
-    bc_ref_policy: DronePolicy | None = None,
     bc_aux_weight: float = 0.0,
 ) -> dict[str, float]:
     """Run ``ppo_epochs`` of clipped PPO over the filled buffer.
 
     Parameters
     ----------
-    bc_ref_policy : DronePolicy | None
-        A **frozen** copy of the BC-pretrained policy.  When given
-        together with ``bc_aux_weight > 0``, an auxiliary MSE loss
-        between the current actor's mean and the frozen actor's
-        mean is added to the total loss.  This provides a smooth
-        transition from BC to free-running PPO.
     bc_aux_weight : float
-        Coefficient for the BC auxiliary loss.  Should decay from
-        ~1.0 → 0.0 over the first portion of training.
+        Coefficient for the BC auxiliary loss that anchors the actor's
+        mean to the **expert PD controller** actions stored in the
+        buffer.  Should decay from ~1.0 → 0.0 over the first portion
+        of training.
     """
     import torch.nn as nn
 
@@ -1308,11 +1374,12 @@ def ppo_update(
         for batch in buffer.sample_batches(batch_size):
             obs = batch["obs"]
             actions = batch["actions"]
+            expert_actions = batch["expert_actions"]
             old_log_probs = batch["old_log_probs"]
             advantages = batch["advantages"]
             returns = batch["returns"]
 
-            new_log_probs, entropy, values = agent.policy.evaluate_actions(obs, actions)
+            new_log_probs, entropy, values, actor_mu = agent.policy.evaluate_actions(obs, actions)
             values = values.squeeze(-1)
 
             # policy loss
@@ -1326,16 +1393,12 @@ def ppo_update(
             # value loss
             value_loss = torch.nn.functional.mse_loss(values, returns)
 
-            # ── BC auxiliary loss (decaying anchor to BC policy) ──────
+            # ── BC auxiliary loss (decaying anchor to expert PD) ──────
             bc_aux_loss = torch.tensor(0.0, device=values.device)
-            if bc_ref_policy is not None and bc_aux_weight > 0.0:
-                with torch.no_grad():
-                    ref_fused, _ = bc_ref_policy._encode_fast(obs)
-                    ref_mu, _ = bc_ref_policy.actor(ref_fused)
-                # Current policy's mean for same obs
-                cur_fused, _ = agent.policy._encode_fast(obs)
-                cur_mu, _ = agent.policy.actor(cur_fused)
-                bc_aux_loss = torch.nn.functional.mse_loss(cur_mu, ref_mu.detach())
+            if bc_aux_weight > 0.0:
+                bc_aux_loss = torch.nn.functional.mse_loss(
+                    actor_mu, expert_actions.detach()
+                )
 
             # combined
             loss = (
@@ -1671,24 +1734,21 @@ def main() -> None:
 
         del expert_data  # free memory
 
-    # ── Frozen BC reference policy for decaying auxiliary loss ───────────
-    bc_ref_policy: DronePolicy | None = None
-    if run_bc and args.bc_decay_epochs > 0:
-        import copy
-
-        bc_ref_policy = copy.deepcopy(agent.policy)
-        bc_ref_policy.eval()
-        for p in bc_ref_policy.parameters():
-            p.requires_grad_(False)
+    # ── Expert PD controller for decaying BC auxiliary loss ───────────
+    # Instead of a frozen neural policy copy, anchor the actor directly
+    # to the expert PD controller actions stored in the rollout buffer.
+    bc_expert: ExpertHoverPolicy | None = None
+    if args.bc_decay_epochs > 0:
+        bc_expert = ExpertHoverPolicy(hover_alt=args.hover_alt, noise_std=0.0)
         print(
-            f"  🔒 Frozen BC reference policy created "
+            f"  🎯 Expert PD anchor for BC auxiliary loss "
             f"(decay over {args.bc_decay_epochs} PPO epochs)\n"
         )
     elif args.bc_epochs > 0 and (args.skip_bc or args.resume):
-        bc_ref_policy = None  # no BC reference when skipping
-        print("  ⏭  Skipping BC phase (--skip-bc or --resume).\n")
+        bc_expert = ExpertHoverPolicy(hover_alt=args.hover_alt, noise_std=0.0)
+        print("  ⏭  Skipping BC phase (--skip-bc or --resume), expert anchor active.\n")
     else:
-        bc_ref_policy = None  # BC disabled (--bc-epochs 0)
+        bc_expert = None  # BC disabled (--bc-epochs 0)
 
     print("┌──────────────────────────────────────────────────────┐")
     print("│  Phase 2 — PPO Self-Supervised Learning              │")
@@ -1709,6 +1769,7 @@ def main() -> None:
                 args.rollout_steps,
                 cfg,
                 hover_alt=args.hover_alt,
+                expert=bc_expert,
             )
         else:
             rollout_stats = collect_rollout(
@@ -1717,11 +1778,12 @@ def main() -> None:
                 buffer,
                 args.rollout_steps,
                 cfg,
+                expert=bc_expert,
             )
 
         # 2. PPO update — with decaying BC auxiliary loss
         ppo_epoch_idx = epoch - start_epoch  # 0-based within this run
-        if bc_ref_policy is not None and ppo_epoch_idx < args.bc_decay_epochs:
+        if bc_expert is not None and ppo_epoch_idx < args.bc_decay_epochs:
             bc_w = 1.0 - ppo_epoch_idx / args.bc_decay_epochs
         else:
             bc_w = 0.0
@@ -1734,7 +1796,6 @@ def main() -> None:
             ppo_epochs=args.ppo_epochs,
             batch_size=args.batch_size,
             scaler=scaler,
-            bc_ref_policy=bc_ref_policy,
             bc_aux_weight=bc_w,
         )
 

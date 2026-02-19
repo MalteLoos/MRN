@@ -422,14 +422,14 @@ class ActorHead(nn.Module):
         self,
         fused: torch.Tensor,
         action: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate log_prob and entropy for a batch of actions."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate log_prob, entropy, **and actor mean** for a batch of actions."""
         mu, log_std = self.forward(fused)
         std = log_std.exp()
         dist = Normal(mu, std)
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        return log_prob, entropy
+        return log_prob, entropy, mu
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +689,7 @@ class DronePolicy(nn.Module):
         self,
         obs: dict[str, torch.Tensor],
         actions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Re-evaluate stored transitions during PPO update.
 
@@ -700,9 +700,10 @@ class DronePolicy(nn.Module):
         Normalizer stats are NOT updated here — only ``normalize()`` is called.
 
         Returns:
-            log_prob : (B,)    (fp32)
-            entropy  : (B,)    (fp32)
-            value    : (B, 1)  (fp32)
+            log_prob  : (B,)    (fp32)
+            entropy   : (B,)    (fp32)
+            value     : (B, 1)  (fp32)
+            actor_mu  : (B, 4)  (fp32) — deterministic actor mean
         """
         dev = obs["imu"].device
         with torch.amp.autocast(  # type: ignore[attr-defined]
@@ -711,9 +712,9 @@ class DronePolicy(nn.Module):
             enabled=(dev.type == "cuda"),
         ):
             fused, _ = self._encode_fast(obs, update_norm=False)
-            log_prob, entropy = self.actor.evaluate(fused, actions)
+            log_prob, entropy, mu = self.actor.evaluate(fused, actions)
             value = self.critic(fused)
-        return log_prob.float(), entropy.float(), value.float()
+        return log_prob.float(), entropy.float(), value.float(), mu.float()
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1122,7 @@ class RolloutBuffer:
         self.waypoints = torch.zeros(buffer_size, wp_dim, device=self.device)
         self.vis_feat = torch.zeros(buffer_size, vis_feat_dim, device=self.device)
         self.actions = torch.zeros(buffer_size, action_dim, device=self.device)
+        self.expert_actions = torch.zeros(buffer_size, action_dim, device=self.device)
         self.log_probs = torch.zeros(buffer_size, device=self.device)
         self.rewards = torch.zeros(buffer_size, device=self.device)
         self.values = torch.zeros(buffer_size, device=self.device)
@@ -1173,6 +1175,7 @@ class RolloutBuffer:
         done: bool,
         hidden: torch.Tensor | None = None,
         flow: torch.Tensor | None = None,
+        expert_action: torch.Tensor | None = None,
     ) -> None:
         """
         Append a single transition.
@@ -1186,6 +1189,9 @@ class RolloutBuffer:
             flow:   (2, H, W) — RAFT flow map for this step (stored on CPU).
                     When provided, FlowEncoder is re-run with gradients
                     during PPO / BC updates.
+            expert_action: (action_dim,) — action the expert PD controller
+                    would produce for this observation.  Used as the BC
+                    auxiliary anchor during PPO.
         """
         assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
 
@@ -1194,6 +1200,8 @@ class RolloutBuffer:
         self.waypoints[i] = waypoints
         self.vis_feat[i] = vis_feat
         self.actions[i] = action
+        if expert_action is not None:
+            self.expert_actions[i] = expert_action
         self.log_probs[i] = log_prob
         self.rewards[i] = reward
         self.values[i] = value.squeeze()
@@ -1285,6 +1293,7 @@ class RolloutBuffer:
             yield {
                 "obs": obs_dict,
                 "actions": self.actions[idx],
+                "expert_actions": self.expert_actions[idx],
                 "old_log_probs": self.log_probs[idx],
                 "advantages": self.advantages[idx],
                 "returns": self.returns[idx],
@@ -1497,7 +1506,7 @@ class PPOTrainer:
                 returns = batch["returns"]
 
                 # Re-evaluate under current policy
-                new_log_probs, entropy, values = self.agent.policy.evaluate_actions(
+                new_log_probs, entropy, values, _mu = self.agent.policy.evaluate_actions(
                     obs, actions
                 )
                 values = values.squeeze(-1)
