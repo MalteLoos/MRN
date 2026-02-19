@@ -185,7 +185,11 @@ class HoverEnvWrapper:
         # policy learns to keep the motors spinning.  action[3]
         # is in [-1, 1]; actual thrust = (action[3]+1)/2.
         actual_thrust = (float(action[3]) + 1.0) / 2.0  # [0, 1]
-        low_thrust_penalty = max(0.0, 0.4 - actual_thrust) * 5.0  # up to 1.75
+        low_thrust_penalty = max(0.0, 0.4 - actual_thrust) * 3.0  # up to 1.75
+        # Near the ground, cutting thrust is much more dangerous —
+        # amplify the penalty so the policy learns to keep motors spinning.
+        if float(pos[2]) < 0.5:
+            low_thrust_penalty = max(0.0, 1.0 - actual_thrust) * 5.0
 
         # tilt penalty — cos(tilt) = 1 - 2(qx² + qy²) = R_33,
         # tilt_penalty = 0 when upright, grows to 2 when inverted.
@@ -346,7 +350,10 @@ class DummyHoverEnv:
 
         # low-thrust penalty
         thrust = float(action[3] + 1.0) / 2.0
-        low_thrust_penalty = max(0.0, 0.4 - thrust) * 5.0
+        low_thrust_penalty = max(0.0, 0.4 - thrust) * 3.0
+        # Near the ground, amplify to discourage cutting thrust.
+        if float(pos[2]) < 0.5:
+            low_thrust_penalty = max(0.0, 1.0 - thrust) * 5.0
 
         # tilt penalty
         q = obs["drone_quat"]
