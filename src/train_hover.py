@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""
+train_hover.py — Short-episode hover training for the dual-rate drone policy.
+
+The drone is spawned at its default takeoff altitude and must hold position.
+Each episode lasts 7 s of sim-time (350 env-steps at 50 Hz).
+
+Waypoints are placed at the hover position so the policy learns to stay
+in place before it is later finetuned for navigation.
+
+Checkpoints are saved every ``--ckpt-every`` epochs.
+Metrics are logged to **Weights & Biases in offline mode** so nothing is
+uploaded during training — call ``wandb sync <run_dir>`` afterwards.
+
+Usage
+-----
+    python3 src/train_hover.py                              # defaults
+    python3 src/train_hover.py --epochs 500 --device cuda   # custom
+    python3 src/train_hover.py --resume runs/hover/ckpt_100.pt
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple  # noqa: F401 — Tuple used in annotations
+
+import numpy as np
+import torch
+
+# ── project imports ─────────────────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from model import (
+    DroneAgent,
+    DronePolicy,
+    ModelConfig,
+    RolloutBuffer,
+    WaypointBuffer,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Hover Environment Wrapper
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class HoverEnvWrapper:
+    """
+    Thin wrapper around ``PX4GazeboEnv`` that:
+
+    1. Maps the environment's obs dict to the keys the model expects.
+    2. Sets up a trivial 2-waypoint route at the hover position.
+    3. Enforces a 7 s episode length.
+    4. Signals ``new_frame`` whenever the camera frame changes.
+    5. Computes a hover-centric reward.
+
+    Obs mapping
+    ───────────
+    env key        → model key
+    ``camera``     → ``cam``
+    ``imu``        → ``imu``
+    ``position``   → ``drone_pos``
+    ``orientation``→ ``drone_quat``
+    ``velocity``   → ``velocity``   (kept for reward)
+    """
+
+    def __init__(
+        self,
+        env,
+        hover_alt: float = 2.5,
+        episode_seconds: float = 3.0,
+        env_dt: float = 0.02,
+    ):
+        self.env = env
+        self.hover_alt = hover_alt
+        self.episode_seconds = episode_seconds
+        self.max_steps = int(episode_seconds / env_dt)
+
+        self._step_count = 0
+        self._prev_cam_id: int | None = None  # track frame identity
+
+        # Out-of-bounds thresholds for early termination
+        self._max_horiz_drift = 8.0   # metres
+        self._max_alt_error = 5.0     # metres
+
+    # ── obs remapping ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _remap_obs(
+        obs: dict[str, np.ndarray],
+        new_frame: bool,
+    ) -> dict[str, Any]:
+        """Remap env observation keys to model-expected keys."""
+        return {
+            "cam": obs["camera"],  # (H, W, 3) uint8
+            "imu": obs["imu"],  # (6,) float32
+            "drone_pos": obs["position"],  # (3,) float32  ENU
+            "drone_quat": obs["orientation"],  # (4,) float32  (w,x,y,z)
+            "velocity": obs["velocity"],  # (3,) float32  ENU
+            "new_frame": new_frame,
+        }
+
+    def _detect_new_frame(self, obs: dict[str, np.ndarray]) -> bool:
+        """Cheap identity check — cameras don't update every tick."""
+        cam_id = id(obs["camera"])
+        if cam_id != self._prev_cam_id:
+            self._prev_cam_id = cam_id
+            return True
+        return False
+
+    # ── gymnasium-like API ─────────────────────────────────────────────────
+
+    def reset(self) -> dict[str, Any]:
+        obs, _info = self.env.reset()
+        self._step_count = 0
+        self._prev_cam_id = None
+        new_frame = self._detect_new_frame(obs)
+        return self._remap_obs(obs, new_frame)
+
+    def step(
+        self, action: torch.Tensor | np.ndarray
+    ) -> Tuple[dict[str, Any], float, bool, dict]:
+        # Map the 4-D model action (roll_rate, pitch_rate, yaw_rate, thrust)
+        # to the env's 4-D action (roll, pitch, yaw_rate, thrust).
+        act_np = np.asarray(action, dtype=np.float32)
+        env_action = np.array(
+            [act_np[0], act_np[1], act_np[2], act_np[3]],
+            dtype=np.float32,
+        )
+
+        obs, _env_reward, terminated, truncated, info = self.env.step(env_action)
+        self._step_count += 1
+
+        new_frame = self._detect_new_frame(obs)
+        mapped = self._remap_obs(obs, new_frame)
+        reward = self._compute_hover_reward(mapped, act_np)
+
+        # Early termination if the drone is hopelessly far away
+        pos = mapped["drone_pos"]
+        alt_error = abs(float(pos[2]) - self.hover_alt)
+        horiz_dist = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
+        out_of_bounds = (
+            alt_error > self._max_alt_error
+            or horiz_dist > self._max_horiz_drift
+        )
+
+        done = terminated or out_of_bounds or (self._step_count >= self.max_steps)
+        if out_of_bounds:
+            reward -= 2.0  # one-time crash penalty
+        return mapped, reward, done, info
+
+    # ── hover-centric reward ───────────────────────────────────────────────
+
+    def _compute_hover_reward(
+        self,
+        obs: dict[str, Any],
+        action: np.ndarray,
+    ) -> float:
+        """
+        Bounded hover reward using exponential kernels.
+
+        Each component is in [0, 1] (1 = perfect), so the total reward
+        ranges roughly from -1 to +1 per step.  This keeps gradients
+        informative across all skill levels — a random policy gets
+        small negative rewards instead of -10+, and a good policy can
+        reach sustained positive values.
+
+        Components:
+            + position keeping  (exp of position error)
+            + velocity damping  (exp of speed)
+            + action smoothness (exp of action magnitude)
+            + alive bonus
+        """
+        pos = obs["drone_pos"]  # ENU
+        vel = obs["velocity"]
+
+        # Position error — exponential kernel, bounded in (0, 1]
+        alt_err = abs(float(pos[2]) - self.hover_alt)
+        horiz_err = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
+        pos_reward = math.exp(-1.0 * (alt_err + horiz_err))  # σ ≈ 1m
+
+        # Velocity damping — want near-zero velocity
+        speed = float(np.linalg.norm(vel))
+        vel_reward = math.exp(-1.5 * speed)  # σ ≈ 0.67 m/s
+
+        # Action smoothness — penalise large rate commands (not thrust)
+        act_mag = float(np.sum(action[:3] ** 2))
+        act_reward = math.exp(-0.5 * act_mag)
+
+        # Weighted combination:
+        #   position is most important, velocity next, action least
+        reward = (
+            0.50 * pos_reward
+            + 0.25 * vel_reward
+            + 0.10 * act_reward
+            + 0.15  # alive bonus — agent gets this just for not crashing
+        )
+        # Centre around zero so early random behaviour is mildly negative
+        # and a perfect hover scores ~+0.7/step
+        reward -= 0.3
+        return reward
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Dummy Hover Environment (for testing without Gazebo)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class DummyHoverEnv:
+    """
+    A simple physics-free dummy that imitates ``HoverEnvWrapper`` for
+    offline testing of the training loop.
+
+    Set ``--dummy`` on the command line to use this instead of the real sim.
+    """
+
+    def __init__(
+        self,
+        hover_alt: float = 2.5,
+        episode_seconds: float = 3.0,
+        env_dt: float = 0.02,
+        cam_h: int = 128,
+        cam_w: int = 128,
+    ):
+        self.hover_alt = hover_alt
+        self.max_steps = int(episode_seconds / env_dt)
+        self.cam_h = cam_h
+        self.cam_w = cam_w
+        self.dt = env_dt
+        self._step_count = 0
+        self._pos = np.array([0.0, 0.0, hover_alt], dtype=np.float32)
+        self._vel = np.zeros(3, dtype=np.float32)
+        self._frame_counter = 0
+        self._max_horiz_drift = 8.0
+        self._max_alt_error = 5.0
+
+    def reset(self) -> dict[str, Any]:
+        self._step_count = 0
+        self._pos = np.array([0.0, 0.0, self.hover_alt], dtype=np.float32)
+        self._vel = np.zeros(3, dtype=np.float32)
+        self._frame_counter = 0
+        return self._obs(new_frame=True)
+
+    def step(self, action):
+        act = np.asarray(action, dtype=np.float32)
+        # Extremely simplified dynamics
+        acc = np.array(
+            [act[0] * 2.0, act[1] * 2.0, (act[3] - 0.5) * 5.0], dtype=np.float32
+        )
+        self._vel += acc * self.dt
+        self._vel *= 0.98  # drag
+        self._pos += self._vel * self.dt
+        self._step_count += 1
+
+        # Camera updates at ~30 Hz ≈ every 1-2 env steps
+        self._frame_counter += 1
+        new_frame = self._frame_counter % 2 == 0
+
+        obs = self._obs(new_frame)
+        reward = self._reward(obs, act)
+
+        # Early termination
+        alt_error = abs(float(self._pos[2]) - self.hover_alt)
+        horiz_dist = math.sqrt(float(self._pos[0]) ** 2 + float(self._pos[1]) ** 2)
+        out_of_bounds = (
+            alt_error > self._max_alt_error
+            or horiz_dist > self._max_horiz_drift
+        )
+        done = out_of_bounds or self._step_count >= self.max_steps
+        if out_of_bounds:
+            reward -= 2.0
+        return obs, reward, done, {}
+
+    def _obs(self, new_frame: bool) -> dict[str, Any]:
+        return {
+            "cam": np.random.randint(
+                0, 255, (self.cam_h, self.cam_w, 3), dtype=np.uint8
+            ),
+            "imu": np.concatenate(
+                [
+                    np.random.randn(3).astype(np.float32) * 0.1,
+                    np.random.randn(3).astype(np.float32) * 0.01,
+                ]
+            ),
+            "drone_pos": self._pos.copy(),
+            "drone_quat": np.array([1, 0, 0, 0], dtype=np.float32),
+            "velocity": self._vel.copy(),
+            "new_frame": new_frame,
+        }
+
+    def _reward(self, obs, action):
+        pos = obs["drone_pos"]
+        vel = obs["velocity"]
+        alt_err = abs(float(pos[2]) - self.hover_alt)
+        horiz_err = math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2)
+        speed = float(np.linalg.norm(vel))
+        act_mag = float(np.sum(action[:3] ** 2))
+
+        pos_reward = math.exp(-1.0 * (alt_err + horiz_err))
+        vel_reward = math.exp(-1.5 * speed)
+        act_reward = math.exp(-0.5 * act_mag)
+
+        reward = (
+            0.50 * pos_reward
+            + 0.25 * vel_reward
+            + 0.10 * act_reward
+            + 0.15
+        )
+        reward -= 0.3
+        return reward
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Training loop
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def make_env(args) -> HoverEnvWrapper | DummyHoverEnv:
+    """Build the hover environment (real or dummy)."""
+    if args.dummy:
+        return DummyHoverEnv(
+            hover_alt=args.hover_alt,
+            episode_seconds=args.episode_secs,
+            cam_h=args.cam_size,
+            cam_w=args.cam_size,
+        )
+
+    # Real PX4 + Gazebo environment
+    from px4_gz_gym.env import PX4GazeboEnv
+
+    raw_env = PX4GazeboEnv(
+        world_name=args.world,
+        cam_obs_height=args.cam_size,
+        cam_obs_width=args.cam_size,
+        max_episode_steps=int(args.episode_secs / 0.02),
+        takeoff_alt=args.hover_alt,
+    )
+    return HoverEnvWrapper(
+        raw_env,
+        hover_alt=args.hover_alt,
+        episode_seconds=args.episode_secs,
+    )
+
+
+def collect_rollout(
+    agent: DroneAgent,
+    env: HoverEnvWrapper | DummyHoverEnv,
+    buffer: RolloutBuffer,
+    rollout_steps: int,
+    cfg: ModelConfig,
+) -> dict[str, float]:
+    """
+    Collect ``rollout_steps`` transitions from the hover env.
+
+    Handles the dual-rate update: vision is only updated when the env
+    signals ``new_frame``; the fast path runs every tick.
+    """
+    buffer.reset()
+    agent.reset_vision()
+    obs = env.reset()
+
+    # Set a trivial hover route (2 waypoints at the same spot)
+    hp = [float(x) for x in obs["drone_pos"][:3]]
+    hover_pos: Tuple[float, float, float] = (hp[0], hp[1], hp[2])
+    agent.set_route([hover_pos, hover_pos])
+    assert agent._buffer is not None
+
+    total_reward = 0.0
+    episodes = 0
+    device = agent.device
+
+    for _ in range(rollout_steps):
+        # ── slow path: update vision on new camera frame ──────────
+        if obs.get("new_frame", False) and "cam" in obs:
+            agent.update_vision(obs)
+
+        # ── prepare fast-path tensors ─────────────────────────────
+        imu = obs["imu"]
+        if not isinstance(imu, torch.Tensor):
+            imu = torch.as_tensor(imu, dtype=torch.float32)
+        imu = imu.to(device)
+
+        dp = [float(x) for x in obs["drone_pos"][:3]]
+        drone_pos: Tuple[float, float, float] = (dp[0], dp[1], dp[2])
+        dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+        drone_quat: Tuple[float, float, float, float] = (dq[0], dq[1], dq[2], dq[3])
+        wp_tensor = agent._buffer.current_targets_tensor(
+            drone_pos,
+            drone_quat=drone_quat,
+            device=device,
+        )
+
+        # Get cached flow map for storage (re-run FlowEncoder with grads
+        # during PPO update)
+        flow = agent.policy._flow_cache
+        if flow is None:
+            flow = torch.zeros(
+                1, 2, cfg.cam_height, cfg.cam_width, device=device,
+            )
+
+        # For inference, use the detached vis_feat cache
+        vis_feat = agent.policy._vis_feat_cache
+        if vis_feat is None:
+            vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
+
+        policy_obs = {
+            "imu": imu.unsqueeze(0),
+            "waypoints": wp_tensor,
+            "vis_feat": vis_feat,
+        }
+        action, log_prob, value = agent.policy.act(policy_obs)
+        action_sq = action.squeeze(0)
+
+        # ── environment step ──────────────────────────────────────
+        next_obs, reward, done, info = env.step(action_sq.cpu())
+
+        # ── store transition ──────────────────────────────────────
+        buffer.store(
+            imu=imu,
+            waypoints=wp_tensor.squeeze(0),
+            flow=flow.squeeze(0),
+            action=action_sq,
+            log_prob=log_prob.squeeze(0),
+            reward=float(reward),
+            value=value,
+            done=done,
+        )
+        total_reward += float(reward)
+
+        if done:
+            obs = env.reset()
+            agent.reset_vision()
+            hp = [float(x) for x in obs["drone_pos"][:3]]
+            hover_pos = (hp[0], hp[1], hp[2])
+            agent.set_route([hover_pos, hover_pos])
+            episodes += 1
+        else:
+            obs = next_obs
+
+    # ── bootstrap last value ──────────────────────────────────────
+    imu = obs["imu"]
+    if not isinstance(imu, torch.Tensor):
+        imu = torch.as_tensor(imu, dtype=torch.float32).to(device)
+    dp = [float(x) for x in obs["drone_pos"][:3]]
+    drone_pos = (dp[0], dp[1], dp[2])
+    dq = [float(x) for x in obs.get("drone_quat", [1, 0, 0, 0])[:4]]
+    drone_quat = (dq[0], dq[1], dq[2], dq[3])
+    assert agent._buffer is not None
+    wp_tensor = agent._buffer.current_targets_tensor(
+        drone_pos,
+        drone_quat=drone_quat,
+        device=device,
+    )
+    vis_feat = agent.policy._vis_feat_cache
+    if vis_feat is None:
+        vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
+    with torch.no_grad():
+        policy_obs = {
+            "imu": imu.unsqueeze(0),
+            "waypoints": wp_tensor,
+            "vis_feat": vis_feat,
+        }
+        _, _, last_value = agent.policy.act(policy_obs)
+    buffer.finish(last_value)
+
+    return {
+        "total_reward": total_reward,
+        "episodes": max(episodes, 1),
+        "mean_reward": total_reward / max(episodes, 1),
+    }
+
+
+def ppo_update(
+    agent: DroneAgent,
+    buffer: RolloutBuffer,
+    optimiser: torch.optim.Optimizer,
+    cfg: ModelConfig,
+    ppo_epochs: int,
+    batch_size: int,
+    scaler: torch.amp.GradScaler | None = None,  # type: ignore[attr-defined]
+) -> dict[str, float]:
+    """Run ``ppo_epochs`` of clipped PPO over the filled buffer."""
+    import torch.nn as nn
+
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    total_entropy = 0.0
+    total_kl = 0.0
+    num_batches = 0
+
+    for _ in range(ppo_epochs):
+        for batch in buffer.sample_batches(batch_size):
+            obs = batch["obs"]
+            actions = batch["actions"]
+            old_log_probs = batch["old_log_probs"]
+            advantages = batch["advantages"]
+            returns = batch["returns"]
+
+            new_log_probs, entropy, values = agent.policy.evaluate_actions(obs, actions)
+            values = values.squeeze(-1)
+
+            # policy loss
+            ratio = (new_log_probs - old_log_probs).exp()
+            surr1 = ratio * advantages
+            surr2 = (
+                torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * advantages
+            )
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # value loss
+            value_loss = torch.nn.functional.mse_loss(values, returns)
+
+            # combined
+            loss = (
+                policy_loss
+                + cfg.value_coef * value_loss
+                - cfg.entropy_coef * entropy.mean()
+            )
+
+            optimiser.zero_grad()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimiser)
+                nn.utils.clip_grad_norm_(agent.policy.parameters(), cfg.max_grad_norm)
+                scaler.step(optimiser)
+                scaler.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.policy.parameters(), cfg.max_grad_norm)
+                optimiser.step()
+
+            with torch.no_grad():
+                approx_kl = (old_log_probs - new_log_probs).mean().item()
+
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_entropy += entropy.mean().item()
+            total_kl += approx_kl
+            num_batches += 1
+
+    n = max(num_batches, 1)
+    return {
+        "policy_loss": total_policy_loss / n,
+        "value_loss": total_value_loss / n,
+        "entropy": total_entropy / n,
+        "approx_kl": total_kl / n,
+    }
+
+
+def save_checkpoint(
+    agent: DroneAgent,
+    optimiser: torch.optim.Optimizer,
+    epoch: int,
+    stats: dict,
+    path: str,
+) -> None:
+    """Save model + optimiser state + metadata."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "policy_state_dict": agent.policy.state_dict(),
+            "optimiser_state_dict": optimiser.state_dict(),
+            "stats": stats,
+        },
+        path,
+    )
+    print(f"  💾 Checkpoint saved → {path}")
+
+
+def load_checkpoint(
+    agent: DroneAgent,
+    optimiser: torch.optim.Optimizer,
+    path: str,
+) -> int:
+    """Load checkpoint and return the epoch number."""
+    ckpt = torch.load(path, map_location=agent.device)
+    agent.policy.load_state_dict(ckpt["policy_state_dict"])
+    optimiser.load_state_dict(ckpt["optimiser_state_dict"])
+    epoch = ckpt.get("epoch", 0)
+    print(f"  ✅ Resumed from {path}  (epoch {epoch})")
+    return epoch
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Train the drone policy to hover (7 s episodes).",
+    )
+    # ── training ────────────────────────────────────────────────────────
+    p.add_argument(
+        "--epochs", type=int, default=200, help="Number of PPO training epochs."
+    )
+    p.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=1024,
+        help="Transitions per rollout (~3 episodes of 350 steps).",
+    )
+    p.add_argument(
+        "--batch-size", type=int, default=64, help="Mini-batch size for PPO updates."
+    )
+    p.add_argument(
+        "--ppo-epochs", type=int, default=8, help="Gradient passes per rollout."
+    )
+    p.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
+
+    # ── environment ─────────────────────────────────────────────────────
+    p.add_argument(
+        "--world",
+        type=str,
+        default="tugbot_depot",
+        help="Gazebo world name (must match SDF in PX4 worlds dir).",
+    )
+    p.add_argument(
+        "--hover-alt", type=float, default=2.5, help="Target hover altitude (m)."
+    )
+    p.add_argument(
+        "--episode-secs", type=float, default=3.0, help="Episode length in sim-seconds."
+    )
+    p.add_argument(
+        "--cam-size",
+        type=int,
+        default=128,
+        help="Camera observation H=W (must be ≥ 128 for RAFT).",
+    )
+    p.add_argument(
+        "--dummy",
+        action="store_true",
+        help="Use a physics-free dummy env for loop testing.",
+    )
+
+    # ── checkpointing & logging ─────────────────────────────────────────
+    p.add_argument(
+        "--run-dir",
+        type=str,
+        default="runs/hover",
+        help="Directory for checkpoints & wandb logs.",
+    )
+    p.add_argument(
+        "--ckpt-every", type=int, default=10, help="Save checkpoint every N epochs."
+    )
+    p.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume from."
+    )
+    p.add_argument(
+        "--wandb-project", type=str, default="drone-hover", help="Wandb project name."
+    )
+
+    # ── hardware ────────────────────────────────────────────────────────
+    p.add_argument("--device", type=str, default="cuda", help="'cpu' or 'cuda'.")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.run_dir, exist_ok=True)
+
+    # ── Weights & Biases (offline) ──────────────────────────────────────
+    import wandb
+
+    os.environ["WANDB_MODE"] = "online"
+    wandb.init(
+        project=args.wandb_project,
+        dir=args.run_dir,
+        config=vars(args),
+        name=f"hover_{time.strftime('%Y%m%d_%H%M%S')}",
+        save_code=True,
+    )
+
+    # ── Model config ────────────────────────────────────────────────────
+    cfg = ModelConfig(
+        cam_height=args.cam_size,
+        cam_width=args.cam_size,
+        lr=args.lr,
+    )
+    wandb.config.update(
+        {k: v for k, v in cfg.__dict__.items()},
+        allow_val_change=True,
+    )
+
+    # ── Agent + optimiser ───────────────────────────────────────────────
+    agent = DroneAgent(cfg=cfg, device=args.device)
+    optimiser = torch.optim.Adam(
+        agent.policy.parameters(),
+        lr=cfg.lr,
+    )
+
+    # Mixed-precision GradScaler for Blackwell / SM 12.0 GPUs where fp32
+    # cuBLAS is broken.  On CPU this is simply None.
+    scaler: torch.amp.GradScaler | None = None  # type: ignore[attr-defined]
+    if args.device.startswith("cuda"):
+        scaler = torch.amp.GradScaler()  # type: ignore[attr-defined]
+
+    start_epoch = 0
+    if args.resume:
+        start_epoch = load_checkpoint(agent, optimiser, args.resume)
+
+    # ── Rollout buffer ──────────────────────────────────────────────────
+    wp_dim = cfg.waypoint_dim * cfg.num_waypoints
+    buffer = RolloutBuffer(
+        buffer_size=args.rollout_steps,
+        imu_dim=cfg.imu_dim,
+        wp_dim=wp_dim,
+        vis_feat_dim=cfg.flow_feature_dim,
+        action_dim=cfg.action_dim,
+        flow_hw=(cfg.cam_height, cfg.cam_width),
+        device=args.device,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+    )
+
+    # ── Environment ─────────────────────────────────────────────────────
+    env = make_env(args)
+
+    # ── Parameter summary ───────────────────────────────────────────────
+    total_p = sum(p.numel() for p in agent.policy.parameters())
+    train_p = sum(p.numel() for p in agent.policy.parameters() if p.requires_grad)
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║          Hover Training — Dual-Rate Policy          ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print(f"║  Device:       {args.device:<38s} ║")
+    print(f"║  Total params: {total_p:<38,d} ║")
+    print(f"║  Trainable:    {train_p:<38,d} ║")
+    print(f"║  Frozen (RAFT):{total_p - train_p:<38,d} ║")
+    print(f"║  Epochs:       {args.epochs:<38d} ║")
+    print(f"║  Rollout steps:{args.rollout_steps:<38d} ║")
+    print(f"║  Episode secs: {args.episode_secs:<38.1f} ║")
+    print(f"║  Hover alt:    {args.hover_alt:<38.1f} ║")
+    print(f"║  Dummy env:    {str(args.dummy):<38s} ║")
+    print(f"║  Run dir:      {args.run_dir:<38s} ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print()
+
+    # ── Training loop ───────────────────────────────────────────────────
+    best_mean_reward = -float("inf")
+
+    for epoch in range(start_epoch, start_epoch + args.epochs):
+        t0 = time.time()
+
+        # 1. Collect rollout
+        rollout_stats = collect_rollout(
+            agent,
+            env,
+            buffer,
+            args.rollout_steps,
+            cfg,
+        )
+
+        # 2. PPO update
+        update_stats = ppo_update(
+            agent,
+            buffer,
+            optimiser,
+            cfg,
+            ppo_epochs=args.ppo_epochs,
+            batch_size=args.batch_size,
+            scaler=scaler,
+        )
+
+        elapsed = time.time() - t0
+        mean_rew = rollout_stats["mean_reward"]
+
+        # 3. Logging
+        log_dict = {
+            "epoch": epoch,
+            "rollout/total_reward": rollout_stats["total_reward"],
+            "rollout/mean_reward": mean_rew,
+            "rollout/episodes": rollout_stats["episodes"],
+            "train/policy_loss": update_stats["policy_loss"],
+            "train/value_loss": update_stats["value_loss"],
+            "train/entropy": update_stats["entropy"],
+            "train/approx_kl": update_stats["approx_kl"],
+            "perf/epoch_time_s": elapsed,
+            "perf/fps": args.rollout_steps / elapsed,
+        }
+        wandb.log(log_dict, step=epoch)
+
+        # Console
+        print(
+            f"[{epoch:4d}]  "
+            f"reward={mean_rew:+7.2f}  "
+            f"π_loss={update_stats['policy_loss']:.4f}  "
+            f"v_loss={update_stats['value_loss']:.4f}  "
+            f"ent={update_stats['entropy']:.3f}  "
+            f"kl={update_stats['approx_kl']:.4f}  "
+            f"({elapsed:.1f}s)"
+        )
+
+        # 4. Checkpointing
+        is_best = mean_rew > best_mean_reward
+        if is_best:
+            best_mean_reward = mean_rew
+
+        if (epoch + 1) % args.ckpt_every == 0 or is_best:
+            ckpt_path = os.path.join(args.run_dir, f"ckpt_{epoch:04d}.pt")
+            save_checkpoint(agent, optimiser, epoch, log_dict, ckpt_path)
+
+        if is_best:
+            best_path = os.path.join(args.run_dir, "best.pt")
+            save_checkpoint(agent, optimiser, epoch, log_dict, best_path)
+
+    # ── Final save ──────────────────────────────────────────────────────
+    final_path = os.path.join(args.run_dir, "final.pt")
+    save_checkpoint(agent, optimiser, start_epoch + args.epochs - 1, {}, final_path)
+
+    wandb.finish()
+    print("\n✅ Training complete.")
+    print(f"   Best mean reward: {best_mean_reward:+.3f}")
+    print(f"   Checkpoints in:   {args.run_dir}/")
+    print(f"   Upload logs:      wandb sync {args.run_dir}/wandb/latest-run")
+
+
+if __name__ == "__main__":
+    main()
