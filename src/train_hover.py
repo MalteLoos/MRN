@@ -84,6 +84,7 @@ class HoverEnvWrapper:
 
         self._step_count = 0
         self._prev_cam_id: int | None = None  # track frame identity
+        self._last_alt: float = 0.0  # track altitude for thrust override
 
     # ── obs remapping ──────────────────────────────────────────────────────
 
@@ -116,6 +117,7 @@ class HoverEnvWrapper:
         obs, _info = self.env.reset()
         self._step_count = 0
         self._prev_cam_id = None
+        self._last_alt = float(obs["position"][2])
         new_frame = self._detect_new_frame(obs)
         return self._remap_obs(obs, new_frame)
 
@@ -125,12 +127,16 @@ class HoverEnvWrapper:
         # Map the 4-D model action (roll_rate, pitch_rate, yaw_rate, thrust)
         # to the env's 4-D action (roll, pitch, yaw_rate, thrust).
         act_np = np.asarray(action, dtype=np.float32)
+        # Safety override: force strong upward thrust when near the ground
+        if self._last_alt < 0.5:
+            act_np[3] = 0.8
         env_action = np.array(
             [act_np[0], act_np[1], act_np[2], act_np[3]],
             dtype=np.float32,
         )
 
         obs, _env_reward, terminated, truncated, info = self.env.step(env_action)
+        self._last_alt = float(obs["position"][2])
         self._step_count += 1
 
         new_frame = self._detect_new_frame(obs)
@@ -283,6 +289,9 @@ class DummyHoverEnv:
 
     def step(self, action):
         act = np.asarray(action, dtype=np.float32)
+        # Safety override: force strong upward thrust when near the ground
+        if self._pos[2] < 0.5:
+            act[3] = 0.8
         # Dynamics with gravity — action[3] maps to thrust:
         #   PX4 thrust = (action[3] + 1) / 2   in [0, 1]
         #   vertical acc = thrust * MAX_THRUST_ACC - GRAVITY
@@ -353,7 +362,7 @@ class DummyHoverEnv:
         low_thrust_penalty = max(0.0, 0.4 - thrust) * 3.0
         # Near the ground, amplify to discourage cutting thrust.
         if float(pos[2]) < 0.5:
-            low_thrust_penalty = max(0.0, 1.0 - thrust) * 5.0
+            low_thrust_penalty = max(0.0, 1.0 - thrust) * 15.0
 
         # tilt penalty
         q = obs["drone_quat"]
