@@ -1491,7 +1491,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rollout-steps",
         type=int,
-        default=32768,
+        default=4096,
         help="Transitions per rollout (~27 episodes of 150 steps).",
     )
     p.add_argument(
