@@ -223,6 +223,7 @@ class _PX4Cmd(Node):
         pitch: float = 0.0,
         yaw: float = 0.0,
         thrust: float = 0.5,
+        yaw_rate: float = 0.0,
     ) -> None:
         """Publish a ``VehicleAttitudeSetpoint``.
 
@@ -230,9 +231,14 @@ class _PX4Cmd(Node):
         ----------
         roll, pitch, yaw : float
             Desired Euler angles in **radians** (NED body frame).
+            The yaw component is baked into ``q_d``.
         thrust : float
             Normalised collective thrust in ``[0, 1]``.  Mapped to
             ``thrust_body[2] = -thrust`` (NED: body-Z points down).
+        yaw_rate : float
+            Feed-forward yaw rate in **rad/s** (NED: positive = CW
+            from above).  Sent via ``yaw_sp_move_rate`` so PX4's
+            rate controller tracks it directly.
         """
         msg = VehicleAttitudeSetpoint()
         msg.timestamp = self._px4_timestamp()
@@ -249,6 +255,10 @@ class _PX4Cmd(Node):
         msg.q_d[1] = sr * cp * cy - cr * sp * sy  # x
         msg.q_d[2] = cr * sp * cy + sr * cp * sy  # y
         msg.q_d[3] = cr * cp * sy - sr * sp * cy  # z
+
+        # Feed-forward yaw rate — PX4's attitude controller adds
+        # this to its own heading-error-based yaw rate command.
+        msg.yaw_sp_move_rate = float(yaw_rate)
 
         # Multicopter thrust: body-Z is "down" in NED, so negative = up
         msg.thrust_body[0] = 0.0
@@ -553,6 +563,7 @@ def publish_attitude_command(
     pitch: float = 0.0,
     yaw: float = 0.0,
     thrust: float = 0.5,
+    yaw_rate: float = 0.0,
 ) -> None:
     """Publish an attitude setpoint to PX4.
 
@@ -565,10 +576,13 @@ def publish_attitude_command(
         Desired Euler angles in radians (NED).
     thrust : float
         Normalised collective thrust ``[0, 1]``.
+    yaw_rate : float
+        Feed-forward yaw rate in rad/s (NED).  Sent via
+        ``yaw_sp_move_rate`` for direct rate tracking.
     """
     node = _ensure_node()
     node.publish_offboard_control_mode(attitude=True, position=False)
-    node.publish_attitude_setpoint(roll, pitch, yaw, thrust)
+    node.publish_attitude_setpoint(roll, pitch, yaw, thrust, yaw_rate=yaw_rate)
 
 
 def publish_offboard_attitude_heartbeat(

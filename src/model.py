@@ -217,22 +217,23 @@ class SlowVisualEncoder(nn.Module):
     def output_dim(self) -> int:
         return self.cfg.flow_feature_dim
 
-    def forward(
+    def compute_flow(
         self,
         img_prev: torch.Tensor,
         img_curr: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute optical-flow features from two consecutive RGB frames.
+        Run the **frozen** RAFT backbone to produce a dense flow map.
+
+        The result is always detached (no gradient through RAFT).
 
         Args:
             img_prev: (B, 3, H, W)  previous frame, float32 in [0, 1].
             img_curr: (B, 3, H, W)  current  frame, float32 in [0, 1].
 
         Returns:
-            vis_feat: (B, flow_feature_dim) — compact visual feature vector.
+            flow: (B, 2, H, W) — dense optical-flow map (fp32, detached).
         """
-        # RAFT expects pixel values in [0, 255]
         prev_255 = img_prev * 255.0
         curr_255 = img_curr * 255.0
 
@@ -243,16 +244,47 @@ class SlowVisualEncoder(nn.Module):
             with torch.amp.autocast(  # type: ignore[attr-defined]
                 device_type=prev_255.device.type, dtype=torch.float16
             ):
-                # raft returns a list of flow predictions; last is most refined
                 flow_preds = self.raft(
                     prev_255,
                     curr_255,
                     num_flow_updates=self.cfg.raft_iters,
                 )
-            flow = flow_preds[-1].float()  # (B, 2, H, W) — back to fp32
+            flow = flow_preds[-1].float()  # (B, 2, H, W)
+        return flow
 
-        # trainable compression
+    def encode_flow(self, flow: torch.Tensor) -> torch.Tensor:
+        """
+        Compress a dense flow map into a compact feature vector.
+
+        This runs the **trainable** ``FlowEncoder`` CNN.  Unlike
+        ``compute_flow``, this method supports gradient flow so that
+        ``FlowEncoder`` can be trained during PPO / BC updates.
+
+        Args:
+            flow: (B, 2, H, W) — dense optical-flow map.
+        Returns:
+            vis_feat: (B, flow_feature_dim)
+        """
         return self.flow_encoder(flow)
+
+    def forward(
+        self,
+        img_prev: torch.Tensor,
+        img_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute optical-flow features from two consecutive RGB frames.
+        Convenience wrapper: runs ``compute_flow`` → ``encode_flow``.
+
+        Args:
+            img_prev: (B, 3, H, W)  previous frame, float32 in [0, 1].
+            img_curr: (B, 3, H, W)  current  frame, float32 in [0, 1].
+
+        Returns:
+            vis_feat: (B, flow_feature_dim) — compact visual feature vector.
+        """
+        flow = self.compute_flow(img_prev, img_curr)
+        return self.encode_flow(flow)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +509,10 @@ class DronePolicy(nn.Module):
         # Cached visual features — filled by update_vision(), consumed by act()
         self._vis_feat_cache: torch.Tensor | None = None
 
+        # Cached RAFT flow map — stored in rollout buffer so FlowEncoder
+        # can be re-run with gradients during PPO / BC updates.
+        self._flow_cache: torch.Tensor | None = None
+
         # Cached GRU hidden state — carried across fast-path ticks
         self._gru_hidden_cache: torch.Tensor | None = None
 
@@ -514,6 +550,10 @@ class DronePolicy(nn.Module):
         Should be called once per camera frame.  Between camera frames the
         fast path reuses the cached feature vector.
 
+        Caches both the raw RAFT flow map (for later re-encoding with
+        gradients during PPO / BC updates) and the compressed vis_feat
+        (for fast-path action selection during rollout).
+
         Args:
             img_prev: (B, C, H, W) float32 in [0, 1]
             img_curr: (B, C, H, W) float32 in [0, 1]
@@ -521,7 +561,9 @@ class DronePolicy(nn.Module):
         Returns:
             vis_feat: (B, flow_feature_dim) — also stored in internal cache.
         """
-        vis_feat = self.slow_visual(img_prev, img_curr)
+        flow = self.slow_visual.compute_flow(img_prev, img_curr)
+        self._flow_cache = flow.detach()
+        vis_feat = self.slow_visual.encode_flow(flow)
         self._vis_feat_cache = vis_feat.detach()
         return vis_feat
 
@@ -564,7 +606,10 @@ class DronePolicy(nn.Module):
 
         Args:
             obs: observation dict with ``imu``, ``waypoints``,
-                 and optionally ``vis_feat`` / ``hidden``.
+                 and optionally ``vis_feat`` / ``hidden`` / ``flow``.
+                 When ``flow`` (B, 2, H, W) is provided, the trainable
+                 FlowEncoder is re-run with gradients to produce
+                 ``vis_feat``, enabling end-to-end training.
             update_norm: if True, update running normalizer statistics
                          (should be True during rollout, False during
                          PPO update).
@@ -573,7 +618,12 @@ class DronePolicy(nn.Module):
             fused:      (B, head_dim) — features for actor/critic heads.
             new_hidden: (1, B, gru_hidden) or None — updated GRU state.
         """
-        vis_feat = self._get_vis_feat(obs)
+        # If raw flow maps are provided (PPO/BC update), re-run the
+        # trainable FlowEncoder so gradients reach its weights.
+        if "flow" in obs and obs["flow"] is not None:
+            vis_feat = self.slow_visual.encode_flow(obs["flow"])
+        else:
+            vis_feat = self._get_vis_feat(obs)
         hidden = self._get_hidden(obs)
 
         # ── Normalise observations ────────────────────────────────────
@@ -867,6 +917,7 @@ class DroneAgent:
         """Clear cached visual and temporal state (call on episode reset)."""
         self._prev_frame = None
         self.policy._vis_feat_cache = None
+        self.policy._flow_cache = None
         self.policy.reset_hidden()
 
     # ----- image helpers --------------------------------------------------
@@ -1042,6 +1093,8 @@ class RolloutBuffer:
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         gru_hidden_dim: int = 0,
+        flow_height: int = 0,
+        flow_width: int = 0,
     ):
         """
         Args:
@@ -1054,6 +1107,8 @@ class RolloutBuffer:
             gamma:        Discount factor.
             gae_lambda:   GAE λ for bias–variance trade-off.
             gru_hidden_dim: GRU hidden size (0 = no GRU state stored).
+            flow_height:  Height of RAFT flow maps (0 = don't store flow).
+            flow_width:   Width of RAFT flow maps (0 = don't store flow).
         """
         self.buffer_size = buffer_size
         self.device = torch.device(device)
@@ -1078,6 +1133,19 @@ class RolloutBuffer:
             )
         else:
             self.hidden_states = None
+
+        # RAFT flow maps — stored on **CPU** to save GPU memory.
+        # During PPO/BC updates, mini-batches are moved to GPU on-the-fly
+        # so the trainable FlowEncoder can be re-run with gradients.
+        self.flow_height = flow_height
+        self.flow_width = flow_width
+        if flow_height > 0 and flow_width > 0:
+            self.flow_maps = torch.zeros(
+                buffer_size, 2, flow_height, flow_width,
+                device="cpu",
+            )
+        else:
+            self.flow_maps = None
 
         # ----- computed after finish() ---------------------------------------
         self.advantages = torch.zeros(buffer_size, device=self.device)
@@ -1104,6 +1172,7 @@ class RolloutBuffer:
         value: torch.Tensor,
         done: bool,
         hidden: torch.Tensor | None = None,
+        flow: torch.Tensor | None = None,
     ) -> None:
         """
         Append a single transition.
@@ -1114,6 +1183,9 @@ class RolloutBuffer:
         Args:
             hidden: (gru_hidden_dim,) — GRU hidden state *before* this step.
                     Required when ``gru_hidden_dim > 0``.
+            flow:   (2, H, W) — RAFT flow map for this step (stored on CPU).
+                    When provided, FlowEncoder is re-run with gradients
+                    during PPO / BC updates.
         """
         assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
 
@@ -1128,6 +1200,8 @@ class RolloutBuffer:
         self.dones[i] = float(done)
         if self.hidden_states is not None and hidden is not None:
             self.hidden_states[i] = hidden
+        if self.flow_maps is not None and flow is not None:
+            self.flow_maps[i] = flow.detach().cpu()
         self.ptr += 1
 
         if self.ptr == self.buffer_size:
@@ -1199,6 +1273,10 @@ class RolloutBuffer:
                 "waypoints": self.waypoints[idx],
                 "vis_feat": self.vis_feat[idx],
             }
+            # Include stored RAFT flow maps so FlowEncoder can be
+            # re-run with gradients during PPO / BC updates.
+            if self.flow_maps is not None:
+                obs_dict["flow"] = self.flow_maps[idx.cpu()].to(self.device)
             # Include stored GRU hidden states for re-evaluation
             if self.hidden_states is not None:
                 # Stored as (B, gru_hidden) → policy expects (1, B, gru_hidden)
@@ -1228,11 +1306,10 @@ class PPOTrainer:
     the slow visual encoder is run and its output is cached / stored
     alongside the transition.
 
-    During the PPO update, only the **fast path** + actor/critic heads are
-    re-evaluated (the stored ``vis_feat`` is treated as a fixed input).
-    The ``FlowEncoder`` CNN is still updated via the gradients that flow
-    through the stored ``vis_feat`` produced during rollout (since we
-    call ``update_vision`` *with* gradients during ``collect_rollout``).
+    During the PPO update the **fast path** + actor/critic heads are
+    re-evaluated.  Raw RAFT flow maps stored in the rollout buffer are
+    re-encoded through the trainable ``FlowEncoder`` CNN **with gradients**,
+    so FlowEncoder is properly trained alongside the rest of the policy.
 
     Usage
     -----
@@ -1273,6 +1350,8 @@ class PPOTrainer:
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
             gru_hidden_dim=agent.policy.gru_hidden_dim,
+            flow_height=self.cfg.cam_height,
+            flow_width=self.cfg.cam_width,
         )
 
         self.optimiser = torch.optim.Adam(
@@ -1327,6 +1406,9 @@ class PPOTrainer:
                     device=self.agent.device,
                 )
 
+            # Get cached RAFT flow map for FlowEncoder re-training
+            flow = self.agent.policy._flow_cache  # (1, 2, H, W) or None
+
             # Snapshot GRU hidden state *before* act() updates it
             pre_hidden = self.agent.policy.get_hidden_state()
 
@@ -1359,6 +1441,7 @@ class PPOTrainer:
                 value=value,
                 done=done,
                 hidden=hidden_flat,
+                flow=flow.squeeze(0) if flow is not None else None,
             )
             total_reward += float(reward)
 

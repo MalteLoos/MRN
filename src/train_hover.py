@@ -410,38 +410,59 @@ class ExpertHoverPolicy:
         #   action[3] = 1.0  →  PX4 1.00  →  full throttle
         #   action[3] = -1.0 →  PX4 0.00  →  zero throttle
 
-        # ── Altitude PID gains ───────────────────────────────────────────
+        # ── Altitude: cascaded P→PI controller ──────────────────────────
         # The thrust mapping is:  PX4_thrust = (action[3]+1)/2
         #   action[3] =  0.0  → PX4 0.50 → hover-neutral
         #   action[3] = +1.0  → PX4 1.00 → full throttle
         #   action[3] = -1.0  → PX4 0.00 → zero throttle
         #
-        # Old gains (kp=0.4, kd=0.25) caused overshoot → over-damp
-        # cycle within the 3 s episode.  The derivative gain was so
-        # high that once the drone started climbing it would cut
-        # thrust to zero, causing a descent → "takes off then lands".
+        # A single PID can't handle a 2.5 m takeoff error AND fine
+        # hover: kp*2.5 ≈ full-throttle → overshoot → bounce.
         #
-        # Fix:  lower kd, raise ki + i_z_max so the integrator can
-        # sustain thrust once the proportional term fades.
-        self.kp_z: float = 0.35     # proportional on altitude error
-        self.ki_z: float = 0.12     # integral — stronger to hold altitude
-        self.kd_z: float = 0.15     # derivative (less aggressive damping)
-        self.thrust_base: float = 0.0   # action=0 → PX4 thrust 0.5 = hover
-        self.i_z_max: float = 0.5   # anti-windup clamp (was 0.3)
+        # Cascade:
+        #   OUTER  target_vz = clamp(kp_pos * alt_err, ±max_vz)
+        #   INNER  thrust = base + kp_vz*(target_vz - vz) + ki_z*∫(alt_err)
+        #
+        # This naturally rate-limits the climb (max_vz m/s) so the
+        # drone ascends gently and never overshoots.
+        # ── Phase 1 (takeoff): fly up with steady thrust until close ────
+        self.takeoff_thrust: float = 0.5   # constant thrust during climb
+        #   PX4 = (0.35+1)/2 = 0.675 → gentle but definite climb
+        self.takeoff_transition: float = 1.5  # switch to PID within this (m)
+
+        # ── Phase 2 (hold): gentle PID for final approach + hover ────────
+        self.kp_pos: float = 0.4     # outer: position error → velocity setpoint
+        self.max_vz: float = 0.3     # outer: slow final approach (0.3 m/s max)
+        self.kp_vz: float = 0.80     # inner: tight velocity tracking
+        self.kd_vz: float = 0.30     # inner: strong damping — kills overshoot
+        self.ki_z: float = 0.55      # inner: integral for steady-state hold
+        self.thrust_base: float = 0.0   # hover-neutral baseline
+        self.i_z_max: float = 0.35   # anti-windup clamp
 
         # ── Horizontal PD gains (body-frame) ─────────────────────────────
-        self.kp_xy: float = 0.15     # proportional on horizontal error
-        self.kd_xy: float = 0.12     # derivative (damp horizontal vel.)
+        self.kp_xy: float = 0.20     # proportional on horizontal error
+        self.kd_xy: float = 0.15     # derivative (damp horizontal vel.)
 
-        # ── Yaw damping ──────────────────────────────────────────────────
-        self.kd_yaw: float = 0.3     # damp gyro-z
+        # ── Yaw PD hold (lock initial heading) ───────────────────────────
+        # The env now sends action[2] as a yaw rate directly to PX4
+        # via yaw_sp_move_rate (no integration).  action[2]=1.0 →
+        # 60°/s yaw rate.  Gains map heading error (rad) + gyro
+        # damping (rad/s) to the [-1,1] action.
+        self.kp_yaw: float = 3.0     # heading error → rate command
+        self.kd_yaw: float = 1.0     # damp gyro-z (prevents overshoot)
 
-        # ── Integrator state (reset on each episode) ─────────────────────
+        # ── Controller state (reset each episode) ────────────────────────
         self._i_z: float = 0.0
+        self._prev_vz: float | None = None
+        self._phase: str = "takeoff"  # "takeoff" or "hold"
+        self._target_yaw: float | None = None  # locked on first obs
 
     def reset(self) -> None:
-        """Reset integrator state at the start of each episode."""
+        """Reset controller state at the start of each episode."""
         self._i_z = 0.0
+        self._prev_vz = None
+        self._phase = "takeoff"
+        self._target_yaw = None
 
     # ------------------------------------------------------------------
 
@@ -452,20 +473,58 @@ class ExpertHoverPolicy:
         quat = np.asarray(obs["drone_quat"], dtype=np.float64)  # w,x,y,z
         imu = np.asarray(obs["imu"], dtype=np.float64)
 
-        # === Altitude PID ===============================================
+        # === Altitude — two-phase controller ============================
         alt_err = self.hover_alt - pos[2]  # >0 → need to climb
         vz = vel[2]                        # >0 → climbing
 
-        # Integrate altitude error (with anti-windup clamp)
-        self._i_z += alt_err * 0.02  # dt ≈ 0.02 s (50 Hz env)
-        self._i_z = max(-self.i_z_max, min(self.i_z_max, self._i_z))
+        # Derivative on vertical velocity (used in both phases)
+        if self._prev_vz is not None:
+            d_vz = (vz - self._prev_vz) / 0.02
+        else:
+            d_vz = 0.0
+        self._prev_vz = vz
 
-        thrust = (
-            self.thrust_base
-            + self.kp_z * alt_err
-            + self.ki_z * self._i_z
-            - self.kd_z * vz
-        )
+        # ── Phase transition: takeoff → hold ──────────────────────────
+        if self._phase == "takeoff" and alt_err < self.takeoff_transition:
+            self._phase = "hold"
+            self._i_z = 0.0   # start integral fresh for hold phase
+
+        # ── Phase: TAKEOFF (constant climb thrust) ────────────────────
+        if self._phase == "takeoff":
+            # Steady thrust to climb.  Damp vertical velocity so we
+            # don't arrive at the transition boundary too fast.
+            thrust = self.takeoff_thrust - 0.20 * d_vz
+
+        # ── Phase: HOLD (gentle PID) ──────────────────────────────────
+        else:
+            # Outer loop: position error → clamped velocity setpoint
+            target_vz = np.clip(
+                self.kp_pos * alt_err, -self.max_vz, self.max_vz
+            )
+            vz_err = target_vz - vz
+
+            # Compute thrust before integral update (back-calc anti-windup)
+            thrust_raw = (
+                self.thrust_base
+                + self.kp_vz * vz_err
+                - self.kd_vz * d_vz
+                + self.ki_z * self._i_z
+            )
+            thrust_clamped = float(np.clip(thrust_raw, -1.0, 1.0))
+
+            # Only accumulate integral when output is not saturated
+            if abs(thrust_raw - thrust_clamped) < 0.01:
+                self._i_z += alt_err * 0.02
+                self._i_z = max(-self.i_z_max, min(self.i_z_max, self._i_z))
+
+            thrust = thrust_clamped
+
+        # ── Safety net: always prevent ground crash ───────────────────
+        # If altitude is very low, guarantee enough thrust to climb.
+        if pos[2] < 0.5:
+            thrust = max(thrust, 0.30)
+        elif pos[2] < self.hover_alt * 0.5 and vz < 0.0:
+            thrust = max(thrust, 0.15)
 
         # === Horizontal PD (in body frame) ==============================
         # World-frame position error  (target = origin)
@@ -475,16 +534,32 @@ class ExpertHoverPolicy:
         err_body = _quat_rotate_inv(quat, err_world)
         vel_body = _quat_rotate_inv(quat, vel_xy_world)
 
-        # Roll:  positive roll → tilt right → accelerate in +body-Y
-        roll = self.kp_xy * err_body[1] - self.kd_xy * vel_body[1]
+        # Action sign conventions (ENU / FLU):
+        #   positive action[0] (roll)  → tilt RIGHT → accelerate in -Y_body
+        #   positive action[1] (pitch) → nose DOWN  → accelerate in +X_body
+        #
+        # So to move toward +Y_body error we need NEGATIVE roll (tilt left),
+        # and to move toward +X_body error we need POSITIVE pitch (nose down).
+        roll = -(self.kp_xy * err_body[1] - self.kd_xy * vel_body[1])
+        pitch = self.kp_xy * err_body[0] - self.kd_xy * vel_body[0]
 
-        # Pitch: positive pitch → nose up → accelerate in -body-X
-        #        so to move *forward* (+body-X) we need *negative* pitch.
-        pitch = -(self.kp_xy * err_body[0] - self.kd_xy * vel_body[0])
+        # === Yaw PD hold (lock initial heading) ========================
+        # Extract current yaw from ENU quaternion (w, x, y, z)
+        qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
+        current_yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy**2 + qz**2),
+        )
+        # Lock target heading on the very first observation
+        if self._target_yaw is None:
+            self._target_yaw = current_yaw
 
-        # === Yaw damping ================================================
-        yaw_rate_meas = imu[5]  # gyro-z
-        yaw = -self.kd_yaw * yaw_rate_meas
+        # Yaw error wrapped to [-π, π]
+        yaw_err = self._target_yaw - current_yaw
+        yaw_err = math.atan2(math.sin(yaw_err), math.cos(yaw_err))
+
+        yaw_rate_meas = imu[5]  # gyro-z (body-frame, ENU/FLU)
+        yaw = self.kp_yaw * yaw_err - self.kd_yaw * yaw_rate_meas
 
         # === Add exploration noise & clip ===============================
         noise = np.random.randn(4) * self.noise_std
@@ -539,6 +614,7 @@ def collect_expert_data(
     imus: list[torch.Tensor] = []
     waypoints_list: list[torch.Tensor] = []
     vis_feats: list[torch.Tensor] = []
+    flows: list[torch.Tensor] = []
     expert_actions: list[torch.Tensor] = []
     rewards_list: list[float] = []
     dones_list: list[bool] = []
@@ -577,6 +653,12 @@ def collect_expert_data(
         imus.append(imu)
         waypoints_list.append(wp_tensor.squeeze(0))
         vis_feats.append(vis_feat.squeeze(0).detach())
+        flow = agent.policy._flow_cache
+        flows.append(
+            flow.squeeze(0).detach().cpu()
+            if flow is not None
+            else torch.zeros(2, cfg.cam_height, cfg.cam_width)
+        )
         expert_actions.append(
             torch.as_tensor(expert_act, dtype=torch.float32, device=device)
         )
@@ -606,6 +688,7 @@ def collect_expert_data(
         "imu": torch.stack(imus),
         "waypoints": torch.stack(waypoints_list),
         "vis_feat": torch.stack(vis_feats),
+        "flow": torch.stack(flows),  # (N, 2, H, W) on CPU
         "expert_actions": torch.stack(expert_actions),
         "rewards": torch.tensor(rewards_list, device=device),
         "dones": torch.tensor(dones_list, dtype=torch.float32, device=device),
@@ -672,6 +755,8 @@ def bc_pretrain(
                 "waypoints": expert_data["waypoints"][idx],
                 "vis_feat": expert_data["vis_feat"][idx],
             }
+            if "flow" in expert_data:
+                obs["flow"] = expert_data["flow"][idx.cpu()].to(device)
             target_actions = expert_data["expert_actions"][idx]
             target_returns = returns[idx]
 
@@ -851,6 +936,9 @@ def collect_rollout(
         if vis_feat is None:
             vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
 
+        # Get cached RAFT flow map for FlowEncoder re-training
+        flow = agent.policy._flow_cache  # (1, 2, H, W) or None
+
         # Snapshot GRU hidden state *before* act() updates it
         pre_hidden = agent.policy.get_hidden_state()
 
@@ -886,6 +974,7 @@ def collect_rollout(
             value=value,
             done=done,
             hidden=hidden_flat,
+            flow=flow.squeeze(0) if flow is not None else None,
         )
         total_reward += float(reward)
 
@@ -1029,6 +1118,7 @@ def collect_rollout_vec(
         imus = []
         wp_tensors = []
         vis_feats = []
+        flows = []
         hidden_flats = []
 
         for i in range(num_envs):
@@ -1059,6 +1149,9 @@ def collect_rollout_vec(
             if vis_feat is None:
                 vis_feat = torch.zeros(1, cfg.flow_feature_dim, device=device)
 
+            # Get cached RAFT flow map for FlowEncoder re-training
+            flow = agent.policy._flow_cache  # (1, 2, H, W) or None
+
             # Snapshot GRU hidden state *before* act() updates it
             pre_hidden = agent.policy.get_hidden_state()
             hidden_flat = (
@@ -1081,6 +1174,7 @@ def collect_rollout_vec(
             imus.append(imu)
             wp_tensors.append(wp_tensor.squeeze(0))
             vis_feats.append(vis_feat.squeeze(0))
+            flows.append(flow.squeeze(0) if flow is not None else None)
             hidden_flats.append(hidden_flat)
 
         n_active = len(actions)
@@ -1122,6 +1216,7 @@ def collect_rollout_vec(
                 value=values[i],
                 done=done,
                 hidden=hidden_flats[i],
+                flow=flows[i],
             )
             total_reward += float(reward)
             steps_collected += 1
@@ -1494,6 +1589,8 @@ def main() -> None:
         gamma=cfg.gamma,
         gae_lambda=cfg.gae_lambda,
         gru_hidden_dim=agent.policy.gru_hidden_dim,
+        flow_height=cfg.cam_height,
+        flow_width=cfg.cam_width,
     )
 
     # ── Environment ─────────────────────────────────────────────────────

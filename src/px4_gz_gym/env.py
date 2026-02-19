@@ -488,13 +488,14 @@ class PX4GazeboEnv(gym.Env):
             action[2]  →  yaw    rate    ∈  [-max_yaw_rate, +max_yaw_rate]
             action[3]  →  thrust         ∈  [0, 1]
 
-        The current yaw is read from the sensor cache.  The policy's
-        yaw-rate output is integrated over one env time-step (``dt``)
-        and added to the current heading to produce the yaw setpoint.
+        The yaw rate is sent directly to PX4 via ``yaw_sp_move_rate``
+        so the rate controller tracks it immediately.  The quaternion
+        ``q_d`` carries the current heading (zero heading error) plus
+        the commanded roll/pitch.
         """
         roll_cmd = float(action[0]) * self.max_roll
         pitch_cmd = float(action[1]) * self.max_pitch
-        yaw_rate_cmd = float(action[2]) * self.max_yaw_rate
+        yaw_rate_cmd_enu = float(action[2]) * self.max_yaw_rate  # rad/s, ENU
         thrust_cmd = float(np.clip((action[3] + 1.0) / 2.0, 0.0, 1.0))
 
         # Current yaw from latest sensor reading (ENU quaternion)
@@ -505,23 +506,26 @@ class PX4GazeboEnv(gym.Env):
             1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2),
         )
 
-        # Integrate yaw rate over one time-step (still ENU)
-        yaw_enu = current_yaw_enu + yaw_rate_cmd * self.dt
-
         # ── ENU → NED conversion for PX4 ──────────────────
         # PX4 expects NED Euler angles:
-        #   NED roll  =  ENU roll   (same axis convention)
+        #   NED roll  =  ENU roll
         #   NED pitch = -ENU pitch  (nose-down positive in NED)
-        #   NED yaw   =  pi/2 - ENU yaw  (90° rotation N↔E)
+        #   NED yaw   =  pi/2 - ENU yaw
         roll_ned = roll_cmd
         pitch_ned = -pitch_cmd
-        yaw_ned = math.pi / 2.0 - yaw_enu
+        yaw_ned = math.pi / 2.0 - current_yaw_enu  # current heading
+
+        # Yaw rate:  ENU positive = CCW from above
+        #            NED positive = CW  from above
+        #            → negate
+        yaw_rate_ned = -yaw_rate_cmd_enu
 
         px4_cmd.publish_attitude_command(
             roll=roll_ned,
             pitch=pitch_ned,
             yaw=yaw_ned,
             thrust=thrust_cmd,
+            yaw_rate=yaw_rate_ned,
         )
 
     # ════════════════════════════════════════════════════════
