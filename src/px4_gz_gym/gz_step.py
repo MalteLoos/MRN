@@ -20,6 +20,9 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from profiling_log import get_profiling_logger as _get_profiling_logger  # noqa: E402
+
 # Ensure compatibility with the system-packaged gz.msgs10 protos
 # which were generated with protoc 3.x.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -207,7 +210,7 @@ class GzStepController:
         if self._poll_total_calls % self._POLL_PRINT_EVERY == 0:
             avg_ms = self._poll_total_wall / self._poll_total_calls * 1000
             avg_polls = self._poll_total_iters / self._poll_total_calls
-            print(
+            _get_profiling_logger()(
                 f"  ⏱  step_and_wait stats ({self._poll_total_calls} calls):  "
                 f"avg {avg_ms:.2f}ms  "
                 f"max {self._poll_max_wall * 1000:.2f}ms  "

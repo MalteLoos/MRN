@@ -58,6 +58,10 @@ from px4_gz_gym.gz_step import GzStepController  # noqa: E402
 from px4_gz_gym.sensors import GzSensors  # noqa: E402
 from px4_gz_gym import px4_cmd  # noqa: E402
 
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+from profiling_log import get_profiling_logger as _get_profiling_logger  # noqa: E402
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Lightweight profiler for hot-path timing
@@ -137,8 +141,7 @@ class StepProfiler:
                 f"{'':>11s}  "
                 f"({other / wall * 100:5.1f}%)"
             )
-        print("\n".join(lines))
-        print()
+        _get_profiling_logger().write_lines(lines)
         self._totals.clear()
         self._counts.clear()
         self._epoch_t0 = time.monotonic()
@@ -408,7 +411,7 @@ class PX4GazeboEnv(gym.Env):
         self._gz.pause()
 
         _reset_wall = time.monotonic() - _reset_t0
-        print(f"  ⏱  reset() total: {_reset_wall:.2f}s")
+        _get_profiling_logger()(f"  ⏱  reset() total: {_reset_wall:.2f}s")
 
         self._step_count = 0
         obs = self._sensors.get_obs()
