@@ -51,6 +51,7 @@ from rclpy.node import Node as RosNode  # noqa: E402
 from sensor_msgs.msg import Image as RosImage, Imu as RosImu  # noqa: E402
 from geometry_msgs.msg import PoseStamped  # noqa: E402
 from nav_msgs.msg import Path  # noqa: E402
+from std_msgs.msg import Float32MultiArray  # noqa: E402
 
 
 class GzSensors:
@@ -110,6 +111,9 @@ class GzSensors:
         # ── Camera ──────────────────────────────────────────
         self._camera_raw: np.ndarray | None = None  # full-res RGB
         self._camera_raw_hw: tuple[int, int] = (0, 0)
+        self._camera_new: bool = False  # True when a new frame arrived
+        self._camera_obs_cache: np.ndarray | None = None  # cached resize
+        self._camera_full_cache: np.ndarray | None = None  # cached copy
 
         # ── Trajectory history for RViz ─────────────────────
         self._trajectory: list[list[float]] = []
@@ -184,10 +188,31 @@ class GzSensors:
             "/drone/trajectory",
             10,
         )
+        self._pub_wp_rel = self._ros_node.create_publisher(
+            Float32MultiArray,
+            "/drone/waypoints_relative",
+            10,
+        )
 
     # ════════════════════════════════════════════════════════
     #  Public API
     # ════════════════════════════════════════════════════════
+
+    def publish_waypoints_relative(self, wp_flat: list[float] | np.ndarray) -> None:
+        """Publish body-frame relative waypoint tensor to ROS 2.
+
+        Parameters
+        ----------
+        wp_flat : list or ndarray, shape (6,)
+            Body-frame relative offsets ``[wp0_x, wp0_y, wp0_z,
+            wp1_x, wp1_y, wp1_z]`` as returned by
+            ``WaypointBuffer.current_targets_tensor()`` (squeezed).
+        """
+        if self._ros_node is None:
+            return
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in wp_flat]
+        self._pub_wp_rel.publish(msg)
 
     def get_obs(self) -> dict[str, np.ndarray]:
         """Return a dict observation (one per env step, ≈ 50 Hz).
@@ -210,14 +235,23 @@ class GzSensors:
                     ]
                 ).astype(np.float32)
 
-            # ── Camera: down-scale for obs ──────────────────
+            # ── Camera: down-scale for obs (cached) ────────
             if self._camera_raw is not None:
-                cam_full = self._camera_raw.copy()
-                cam_obs = cv2.resize(
-                    cam_full,
-                    (self.cam_obs_width, self.cam_obs_height),
-                    interpolation=cv2.INTER_AREA,
-                )
+                if self._camera_new or self._camera_obs_cache is None:
+                    # New frame arrived — resize and cache
+                    cam_full = self._camera_raw.copy()
+                    cam_obs = cv2.resize(
+                        cam_full,
+                        (self.cam_obs_width, self.cam_obs_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    self._camera_obs_cache = cam_obs
+                    self._camera_full_cache = cam_full
+                    self._camera_new = False
+                else:
+                    # Reuse cached resize (camera ~30 Hz, env ~50 Hz)
+                    cam_obs = self._camera_obs_cache
+                    cam_full = self._camera_full_cache
             else:
                 cam_full = None
                 cam_obs = np.zeros(
@@ -265,6 +299,22 @@ class GzSensors:
                     self._lin_acc,
                 ]
             ).astype(np.float32)
+
+    def reset_state(self) -> None:
+        """Zero all cached velocity / acceleration state for a clean
+        episode start.
+
+        Must be called during ``env.reset()`` **after** teleporting
+        the model, so that the first observation does not carry stale
+        velocity or angular-velocity values from the previous episode
+        (the odom callback may not have fired yet at that point).
+        """
+        with self._lock:
+            self._vel[:] = 0.0
+            self._ang_vel[:] = 0.0
+            self._lin_acc[:] = 0.0
+            self._imu_buffer.clear()
+            self._trajectory.clear()
 
     def clear_imu_buffer(self) -> None:
         """Clear buffered IMU readings (call on episode reset)."""
@@ -327,6 +377,7 @@ class GzSensors:
         with self._lock:
             self._camera_raw = img
             self._camera_raw_hw = (h, w)
+            self._camera_new = True
 
     def _on_pose_v(self, msg: Pose_V) -> None:
         """Fallback — extract our model from the ``Pose_V`` bundle."""

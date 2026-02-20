@@ -9,4 +9,16 @@ from px4_gz_gym.gz_step import GzStepController  # noqa: F401
 from px4_gz_gym.sensors import GzSensors  # noqa: F401
 from px4_gz_gym import px4_cmd  # noqa: F401
 
-__all__ = ["PX4GazeboEnv", "GzStepController", "GzSensors", "px4_cmd"]
+try:
+    from px4_gz_gym.vec_env import SubprocVecEnv, AsyncResetVecEnv  # noqa: F401
+except ImportError:
+    pass  # multiprocessing may not be available in all contexts
+
+__all__ = [
+    "PX4GazeboEnv",
+    "GzStepController",
+    "GzSensors",
+    "px4_cmd",
+    "SubprocVecEnv",
+    "AsyncResetVecEnv",
+]

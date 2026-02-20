@@ -223,6 +223,7 @@ class _PX4Cmd(Node):
         pitch: float = 0.0,
         yaw: float = 0.0,
         thrust: float = 0.5,
+        yaw_rate: float = 0.0,
     ) -> None:
         """Publish a ``VehicleAttitudeSetpoint``.
 
@@ -230,9 +231,14 @@ class _PX4Cmd(Node):
         ----------
         roll, pitch, yaw : float
             Desired Euler angles in **radians** (NED body frame).
+            The yaw component is baked into ``q_d``.
         thrust : float
             Normalised collective thrust in ``[0, 1]``.  Mapped to
             ``thrust_body[2] = -thrust`` (NED: body-Z points down).
+        yaw_rate : float
+            Feed-forward yaw rate in **rad/s** (NED: positive = CW
+            from above).  Sent via ``yaw_sp_move_rate`` so PX4's
+            rate controller tracks it directly.
         """
         msg = VehicleAttitudeSetpoint()
         msg.timestamp = self._px4_timestamp()
@@ -249,6 +255,10 @@ class _PX4Cmd(Node):
         msg.q_d[1] = sr * cp * cy - cr * sp * sy  # x
         msg.q_d[2] = cr * sp * cy + sr * cp * sy  # y
         msg.q_d[3] = cr * cp * sy - sr * sp * cy  # z
+
+        # Feed-forward yaw rate — PX4's attitude controller adds
+        # this to its own heading-error-based yaw rate command.
+        msg.yaw_sp_move_rate = float(yaw_rate)
 
         # Multicopter thrust: body-Z is "down" in NED, so negative = up
         msg.thrust_body[0] = 0.0
@@ -553,6 +563,7 @@ def publish_attitude_command(
     pitch: float = 0.0,
     yaw: float = 0.0,
     thrust: float = 0.5,
+    yaw_rate: float = 0.0,
 ) -> None:
     """Publish an attitude setpoint to PX4.
 
@@ -565,10 +576,13 @@ def publish_attitude_command(
         Desired Euler angles in radians (NED).
     thrust : float
         Normalised collective thrust ``[0, 1]``.
+    yaw_rate : float
+        Feed-forward yaw rate in rad/s (NED).  Sent via
+        ``yaw_sp_move_rate`` for direct rate tracking.
     """
     node = _ensure_node()
     node.publish_offboard_control_mode(attitude=True, position=False)
-    node.publish_attitude_setpoint(roll, pitch, yaw, thrust)
+    node.publish_attitude_setpoint(roll, pitch, yaw, thrust, yaw_rate=yaw_rate)
 
 
 def publish_offboard_attitude_heartbeat(
@@ -591,6 +605,269 @@ def publish_offboard_attitude_heartbeat(
     )
 
 
+# ════════════════════════════════════════════════════════
+#  Sim-stepped reset helpers  (no wall-clock sleeps)
+# ════════════════════════════════════════════════════════
+#
+# These variants accept a ``step_fn(n)`` callback that advances
+# the simulator by *n* physics steps **deterministically**.  All
+# waiting is done by stepping the sim forward (fast, < 1 ms per
+# batch) instead of ``time.sleep()`` which wastes wall-clock time.
+#
+# This turns a 60–130 s reset into ~2–5 s wall-clock.
+# ════════════════════════════════════════════════════════
+
+
+def is_connected() -> bool:
+    """True if at least one VehicleStatus has been received."""
+    return _ensure_node().connected
+
+
+def is_armed() -> bool:
+    """True if PX4 reports armed."""
+    return _ensure_node().armed
+
+
+def is_in_offboard() -> bool:
+    """True if PX4 nav_state == OFFBOARD."""
+    return _ensure_node().in_offboard
+
+
+def stepped_wait_for_connection(
+    step_fn,
+    steps_per_iter: int = 50,
+    max_iters: int = 300,
+) -> bool:
+    """Wait for PX4 DDS connection by stepping the sim forward.
+
+    Each iteration advances ``steps_per_iter`` physics steps (= 0.2 s
+    sim-time at 0.004 s step size) instead of wall-clock sleeping.
+    Total max wait: 300 × 50 × 0.004 = 60 s sim-time.
+    """
+    node = _ensure_node()
+    for _ in range(max_iters):
+        if node.connected:
+            return True
+        step_fn(steps_per_iter)
+    node.get_logger().warn("stepped_wait_for_connection timed out")
+    return False
+
+
+def stepped_stream_setpoints(
+    step_fn,
+    z_enu: float = 2.5,
+    sim_seconds: float = 2.0,
+    ticks_per_publish: int = 5,
+    step_size: float = 0.004,
+) -> None:
+    """Stream OffboardControlMode + position setpoints while stepping.
+
+    PX4 requires ``OffboardControlMode`` at ≥ 2 Hz for ≥ 2 s of
+    sim-time before it accepts the OFFBOARD mode switch.  This
+    function publishes at **50 Hz** (every ``ticks_per_publish``
+    physics steps = every 0.02 s sim-time) to keep PX4 happy.
+
+    With defaults: 2.0 s / (5 × 0.004) = 100 publishes, each
+    separated by 5 physics steps.  Wall-clock: ~0.1 s.
+    """
+    node = _ensure_node()
+    z_ned = -abs(z_enu)
+    n_publishes = int(sim_seconds / (ticks_per_publish * step_size))
+    for _ in range(n_publishes):
+        node.publish_offboard_control_mode(position=True)
+        node.publish_setpoint(0.0, 0.0, z_ned)
+        step_fn(ticks_per_publish)
+
+
+def stepped_switch_to_offboard(
+    step_fn,
+    z_enu: float = 2.5,
+    ticks_per_publish: int = 5,
+    max_sim_seconds: float = 10.0,
+    step_size: float = 0.004,
+) -> bool:
+    """Switch to OFFBOARD mode, stepping sim between retries.
+
+    Publishes setpoints at 50 Hz (every ``ticks_per_publish`` physics
+    steps) to avoid PX4's offboard timeout, and sends the mode-switch
+    command every 0.2 s of sim-time.
+    """
+    node = _ensure_node()
+    z_ned = -abs(z_enu)
+    max_iters = int(max_sim_seconds / (ticks_per_publish * step_size))
+    mode_cmd_interval = max(1, int(0.2 / (ticks_per_publish * step_size)))
+    for i in range(max_iters):
+        if node.in_offboard:
+            return True
+        node.publish_offboard_control_mode(position=True)
+        node.publish_setpoint(0.0, 0.0, z_ned)
+        if i % mode_cmd_interval == 0:
+            node.set_mode_offboard()
+        step_fn(ticks_per_publish)
+    node.get_logger().warn("stepped_switch_to_offboard timed out")
+    return False
+
+
+def stepped_arm_and_takeoff(
+    step_fn,
+    target_alt: float = 2.5,
+    get_altitude=None,
+    ticks_per_publish: int = 5,
+    step_size: float = 0.004,
+    arm_timeout_s: float = 10.0,
+    climb_timeout_s: float = 20.0,
+) -> bool:
+    """Arm and fly to *target_alt* using sim-stepping.
+
+    Setpoints are published every ``ticks_per_publish`` physics steps
+    (default: every 5 ticks = 0.02 s sim-time = 50 Hz) so PX4's
+    offboard heartbeat never times out.
+
+    The arm command is sent every 0.5 s sim-time until PX4 confirms
+    armed.  After arming, the position setpoint drives the drone to
+    ``target_alt``.
+
+    Parameters
+    ----------
+    step_fn : callable(int)
+        Advances the simulator by N physics steps.
+    ticks_per_publish : int
+        Physics steps between each setpoint publish (5 = 50 Hz).
+    arm_timeout_s : float
+        Max sim-time seconds to wait for arming.
+    climb_timeout_s : float
+        Max sim-time seconds to wait for altitude.
+    """
+    node = _ensure_node()
+    z_ned = -abs(target_alt)
+    dt_per_iter = ticks_per_publish * step_size  # 0.02 s default
+
+    # ── Arm (retry, keep streaming setpoints at 50 Hz) ─────
+    arm_iters = int(arm_timeout_s / dt_per_iter)
+    arm_cmd_interval = max(1, int(0.5 / dt_per_iter))  # arm cmd every 0.5 s sim
+    for i in range(arm_iters):
+        if node.armed:
+            break
+        node.publish_offboard_control_mode(position=True)
+        node.publish_setpoint(0.0, 0.0, z_ned)
+        if i % arm_cmd_interval == 0:
+            node.arm()
+        step_fn(ticks_per_publish)
+
+    if not node.armed:
+        node.get_logger().warn("stepped_arm_and_takeoff: failed to arm")
+        return False
+
+    # ── Climb to target altitude ────────────────────────────
+    if get_altitude is not None:
+        climb_iters = int(climb_timeout_s / dt_per_iter)
+        for _ in range(climb_iters):
+            alt = get_altitude()
+            if alt >= target_alt - 0.5:
+                break
+            node.publish_offboard_control_mode(position=True)
+            node.publish_setpoint(0.0, 0.0, z_ned)
+            step_fn(ticks_per_publish)
+
+    return True
+
+
+def stepped_stream_attitude(
+    step_fn,
+    sim_seconds: float = 2.0,
+    ticks_per_publish: int = 5,
+    step_size: float = 0.004,
+    hover_thrust: float = 0.5,
+) -> None:
+    """Stream **attitude-mode** offboard heartbeats while stepping.
+
+    Publishes ``OffboardControlMode(attitude=True)`` + a neutral
+    ``VehicleAttitudeSetpoint`` (level, hover thrust) at 50 Hz.
+    PX4 needs ≥ 2 Hz for ≥ 2 s sim-time before it accepts OFFBOARD.
+    """
+    node = _ensure_node()
+    n_publishes = int(sim_seconds / (ticks_per_publish * step_size))
+    for _ in range(n_publishes):
+        node.publish_offboard_control_mode(attitude=True, position=False)
+        node.publish_attitude_setpoint(
+            roll=0.0, pitch=0.0, yaw=0.0, thrust=hover_thrust,
+        )
+        step_fn(ticks_per_publish)
+
+
+def stepped_offboard_arm(
+    step_fn,
+    ticks_per_publish: int = 5,
+    step_size: float = 0.004,
+    offboard_timeout_s: float = 10.0,
+    arm_timeout_s: float = 10.0,
+    hover_thrust: float = 0.5,
+) -> bool:
+    """Switch to OFFBOARD **attitude** mode and arm.
+
+    No climb phase — the policy takes over from ground level.
+    Publishes neutral attitude setpoints at 50 Hz throughout to
+    keep PX4's offboard heartbeat alive.
+
+    Returns True if both offboard switch and arming succeeded.
+    """
+    node = _ensure_node()
+    dt_per_iter = ticks_per_publish * step_size
+
+    def _publish_attitude_heartbeat() -> None:
+        node.publish_offboard_control_mode(attitude=True, position=False)
+        node.publish_attitude_setpoint(
+            roll=0.0, pitch=0.0, yaw=0.0, thrust=hover_thrust,
+        )
+
+    # ── Switch to OFFBOARD ──────────────────────────────────
+    offboard_iters = int(offboard_timeout_s / dt_per_iter)
+    mode_cmd_interval = max(1, int(0.2 / dt_per_iter))  # every 0.2 s sim
+    for i in range(offboard_iters):
+        if node.in_offboard:
+            break
+        _publish_attitude_heartbeat()
+        if i % mode_cmd_interval == 0:
+            node.set_mode_offboard()
+        step_fn(ticks_per_publish)
+
+    if not node.in_offboard:
+        node.get_logger().warn("stepped_offboard_arm: failed to enter OFFBOARD")
+        return False
+
+    # ── Arm ─────────────────────────────────────────────────
+    arm_iters = int(arm_timeout_s / dt_per_iter)
+    arm_cmd_interval = max(1, int(0.5 / dt_per_iter))  # every 0.5 s sim
+    for i in range(arm_iters):
+        if node.armed:
+            break
+        _publish_attitude_heartbeat()
+        if i % arm_cmd_interval == 0:
+            node.arm()
+        step_fn(ticks_per_publish)
+
+    if not node.armed:
+        node.get_logger().warn("stepped_offboard_arm: failed to arm")
+        return False
+
+    return True
+
+
+def stepped_wait_for_disarm(
+    step_fn,
+    steps_per_iter: int = 50,
+    max_iters: int = 50,
+) -> bool:
+    """Wait for PX4 to disarm by stepping sim forward."""
+    node = _ensure_node()
+    for _ in range(max_iters):
+        if not node.armed:
+            return True
+        node.disarm(force=True)
+        step_fn(steps_per_iter)
+    return not node.armed
+
+
 def land_and_disarm(timeout: float = 15.0) -> bool:
     """Switch to AUTO.LAND and wait for disarm (best-effort)."""
     node = _ensure_node()
@@ -611,10 +888,14 @@ def land_and_disarm(timeout: float = 15.0) -> bool:
 #  PX4 NSH console commands  (via tmux)
 # ════════════════════════════════════════════════════════════
 
+# Default tmux target — overridden by SubprocVecEnv workers
+# to point at their per-worker tmux session.
+_DEFAULT_TMUX_TARGET = "px4sim:sim.1"
+
 
 def nsh_command(
     cmd: str,
-    tmux_target: str = "px4sim:sim.1",
+    tmux_target: str | None = None,
 ) -> None:
     """Send an NSH shell command to the PX4 SITL console.
 
@@ -626,20 +907,22 @@ def nsh_command(
     ----------
     cmd : str
         The NSH command to run (e.g. ``"ekf2 stop"``).
-    tmux_target : str
+    tmux_target : str, optional
         tmux target pane (``session:window.pane``).
+        Defaults to ``_DEFAULT_TMUX_TARGET``.
     """
     import subprocess as _sp
 
+    target = tmux_target or _DEFAULT_TMUX_TARGET
     _sp.run(
-        ["tmux", "send-keys", "-t", tmux_target, cmd, "Enter"],
+        ["tmux", "send-keys", "-t", target, cmd, "Enter"],
         check=False,
         capture_output=True,
     )
 
 
 def restart_ekf2(
-    tmux_target: str = "px4sim:sim.1",
+    tmux_target: str | None = None,
     settle_time: float = 0.5,
 ) -> None:
     """Stop and restart EKF2 so all filter state is wiped.
@@ -648,15 +931,16 @@ def restart_ekf2(
     so the estimator starts fresh with no stale covariance,
     innovation history, or fault flags from the previous episode.
     """
-    nsh_command("ekf2 stop", tmux_target=tmux_target)
+    target = tmux_target or _DEFAULT_TMUX_TARGET
+    nsh_command("ekf2 stop", tmux_target=target)
     time.sleep(settle_time)
-    nsh_command("ekf2 start", tmux_target=tmux_target)
+    nsh_command("ekf2 start", tmux_target=target)
     time.sleep(settle_time)
 
 
 def restart_px4(
-    tmux_target: str = "px4sim:sim.1",
-    settle_time: float = 0.1,
+    tmux_target: str | None = None,
+    settle_time: float = 0.05,
 ) -> None:
     """Stop and restart all key PX4 modules for a clean episode.
 
@@ -667,6 +951,12 @@ def restart_px4(
     cycled.
 
     Call this during ``env.reset()`` after teleporting the drone.
+
+    .. note::
+       The sleeps here are intentionally minimal (just enough for
+       tmux send-keys to be processed).  The caller should use
+       sim-stepping to give PX4 the sim-time it needs to
+       re-initialise modules and converge EKF2.
     """
     # Modules listed in dependency order (stop in reverse,
     # start in forward order).
@@ -683,15 +973,16 @@ def restart_px4(
     ]
 
     # ── Stop all modules ────────────────────────────────────
+    target = tmux_target or _DEFAULT_TMUX_TARGET
     for mod in modules:
-        nsh_command(f"{mod} stop", tmux_target=tmux_target)
-        time.sleep(0.1)
+        nsh_command(f"{mod} stop", tmux_target=target)
+        time.sleep(0.02)  # minimal: just enough for tmux delivery
 
     time.sleep(settle_time)
 
     # ── Start all modules (reverse order) ───────────────────
     for mod in reversed(modules):
-        nsh_command(f"{mod} start", tmux_target=tmux_target)
-        time.sleep(0.1)
+        nsh_command(f"{mod} start", tmux_target=target)
+        time.sleep(0.02)  # minimal: just enough for tmux delivery
 
     time.sleep(settle_time)

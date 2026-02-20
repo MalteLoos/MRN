@@ -64,8 +64,9 @@ class ModelConfig:
     num_waypoints: int = 2  # always 2 look-ahead waypoints
 
     # --- Fast-path backbone ---------------------------------------------------
-    fast_hidden: int = 128  # hidden size of the fast MLP
-    fast_layers: int = 2
+    fast_hidden: int = 256  # hidden size of the fast MLP
+    fast_layers: int = 3
+    gru_hidden: int = 128   # GRU recurrent hidden size (0 = disable GRU)
 
     # --- Actor (policy) -------------------------------------------------------
     action_dim: int = 4  # roll_rate, pitch_rate, yaw_rate, thrust
@@ -83,6 +84,68 @@ class ModelConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Running observation normalizer
+# ---------------------------------------------------------------------------
+
+
+class RunningNormalizer(nn.Module):
+    """Welford online running-mean / variance normalizer.
+
+    Keeps per-feature running statistics and normalises inputs to
+    approximately zero mean and unit variance.  Statistics are stored as
+    buffers (not parameters) so they survive ``state_dict`` round-trips
+    but are never updated by the optimiser.
+
+    The normalizer is updated during rollout collection (``training=True``)
+    and frozen during PPO updates / inference (``training=False``).  Call
+    ``update(x)`` to incorporate a new sample **and** return the normalised
+    value, or ``normalize(x)`` to normalise without updating stats.
+
+    Clip range avoids numerical explosions from rare outliers.
+    """
+
+    def __init__(self, dim: int, clip: float = 5.0, epsilon: float = 1e-8):
+        super().__init__()
+        self.clip = clip
+        self.epsilon = epsilon
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var", torch.ones(dim))
+        self.register_buffer("count", torch.tensor(1e-4))  # small init avoids div-by-0
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> torch.Tensor:
+        """Update running stats with *x* and return normalised *x*.
+
+        Args:
+            x: (\*batch, dim) — the last dimension is normalised.
+
+        Works correctly with any number of leading batch dimensions.
+        """
+        if self.training:
+            flat = x.reshape(-1, x.shape[-1])
+            batch_mean = flat.mean(dim=0)
+            batch_var = flat.var(dim=0, unbiased=False)
+            batch_count = flat.shape[0]
+
+            delta = batch_mean - self.mean
+            total = self.count + batch_count
+            self.mean = self.mean + delta * batch_count / total
+            m_a = self.var * self.count
+            m_b = batch_var * batch_count
+            m2 = m_a + m_b + delta**2 * self.count * batch_count / total
+            self.var = m2 / total
+            self.count = total
+
+        return self.normalize(x)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise *x* using current running statistics (no stat update)."""
+        return ((x - self.mean) / (self.var + self.epsilon).sqrt()).clamp(
+            -self.clip, self.clip
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +217,23 @@ class SlowVisualEncoder(nn.Module):
     def output_dim(self) -> int:
         return self.cfg.flow_feature_dim
 
-    def forward(
+    def compute_flow(
         self,
         img_prev: torch.Tensor,
         img_curr: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute optical-flow features from two consecutive RGB frames.
+        Run the **frozen** RAFT backbone to produce a dense flow map.
+
+        The result is always detached (no gradient through RAFT).
 
         Args:
             img_prev: (B, 3, H, W)  previous frame, float32 in [0, 1].
             img_curr: (B, 3, H, W)  current  frame, float32 in [0, 1].
 
         Returns:
-            vis_feat: (B, flow_feature_dim) — compact visual feature vector.
+            flow: (B, 2, H, W) — dense optical-flow map (fp32, detached).
         """
-        # RAFT expects pixel values in [0, 255]
         prev_255 = img_prev * 255.0
         curr_255 = img_curr * 255.0
 
@@ -180,16 +244,47 @@ class SlowVisualEncoder(nn.Module):
             with torch.amp.autocast(  # type: ignore[attr-defined]
                 device_type=prev_255.device.type, dtype=torch.float16
             ):
-                # raft returns a list of flow predictions; last is most refined
                 flow_preds = self.raft(
                     prev_255,
                     curr_255,
                     num_flow_updates=self.cfg.raft_iters,
                 )
-            flow = flow_preds[-1].float()  # (B, 2, H, W) — back to fp32
+            flow = flow_preds[-1].float()  # (B, 2, H, W)
+        return flow
 
-        # trainable compression
+    def encode_flow(self, flow: torch.Tensor) -> torch.Tensor:
+        """
+        Compress a dense flow map into a compact feature vector.
+
+        This runs the **trainable** ``FlowEncoder`` CNN.  Unlike
+        ``compute_flow``, this method supports gradient flow so that
+        ``FlowEncoder`` can be trained during PPO / BC updates.
+
+        Args:
+            flow: (B, 2, H, W) — dense optical-flow map.
+        Returns:
+            vis_feat: (B, flow_feature_dim)
+        """
         return self.flow_encoder(flow)
+
+    def forward(
+        self,
+        img_prev: torch.Tensor,
+        img_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute optical-flow features from two consecutive RGB frames.
+        Convenience wrapper: runs ``compute_flow`` → ``encode_flow``.
+
+        Args:
+            img_prev: (B, 3, H, W)  previous frame, float32 in [0, 1].
+            img_curr: (B, 3, H, W)  current  frame, float32 in [0, 1].
+
+        Returns:
+            vis_feat: (B, flow_feature_dim) — compact visual feature vector.
+        """
+        flow = self.compute_flow(img_prev, img_curr)
+        return self.encode_flow(flow)
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +294,18 @@ class SlowVisualEncoder(nn.Module):
 
 class FastStateEncoder(nn.Module):
     """
-    Lightweight MLP that fuses IMU, look-ahead waypoints, **and** the
+    MLP + optional GRU that fuses IMU, look-ahead waypoints, **and** the
     cached visual feature on every IMU tick.
+
+    When ``cfg.gru_hidden > 0`` a single-layer GRU sits after the MLP,
+    giving the policy *temporal memory* across consecutive ticks.  This
+    lets the network implicitly estimate velocities and detect oscillation
+    patterns from raw IMU/waypoint sequences rather than relying on an
+    explicit velocity input.
+
+    The GRU hidden state must be managed by the caller (``DronePolicy``):
+    - passed in and returned at each step during rollout,
+    - stored in the rollout buffer for PPO re-evaluation.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -215,25 +320,48 @@ class FastStateEncoder(nn.Module):
             )
             layers.append(nn.ReLU(inplace=True))
         self.net = nn.Sequential(*layers)
-        self.output_dim = cfg.fast_hidden
+
+        # Optional GRU temporal layer
+        self.use_gru = cfg.gru_hidden > 0
+        if self.use_gru:
+            self.gru = nn.GRU(
+                input_size=cfg.fast_hidden,
+                hidden_size=cfg.gru_hidden,
+                num_layers=1,
+                batch_first=True,
+            )
+            self.output_dim = cfg.gru_hidden
+        else:
+            self.output_dim = cfg.fast_hidden
 
     def forward(
         self,
         imu: torch.Tensor,
         waypoints: torch.Tensor,
         vis_feat: torch.Tensor,
-    ) -> torch.Tensor:
+        hidden: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             imu:       (B, imu_dim)           — [ax, ay, az, gx, gy, gz]
             waypoints: (B, num_wp * wp_dim)   — flattened body-frame waypoints
             vis_feat:  (B, flow_feature_dim)  — cached slow-path output
+            hidden:    (1, B, gru_hidden) or None — GRU hidden state
 
         Returns:
-            features: (B, fast_hidden)
+            features: (B, output_dim)
+            new_hidden: (1, B, gru_hidden) or None
         """
         x = torch.cat([imu, waypoints, vis_feat], dim=-1)
-        return self.net(x)
+        x = self.net(x)
+
+        if self.use_gru:
+            # GRU expects (B, seq=1, features)
+            x_seq = x.unsqueeze(1)
+            gru_out, new_hidden = self.gru(x_seq, hidden)
+            return gru_out.squeeze(1), new_hidden
+
+        return x, None
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +377,12 @@ class ActorHead(nn.Module):
         [roll_rate, pitch_rate, yaw_rate, thrust]
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, input_dim: int | None = None):
         super().__init__()
         self.cfg = cfg
+        _in = input_dim or (cfg.gru_hidden if cfg.gru_hidden > 0 else cfg.fast_hidden)
         self.mu = nn.Sequential(
-            nn.Linear(cfg.fast_hidden, 64),
+            nn.Linear(_in, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, cfg.action_dim),
             nn.Tanh(),  # bound means to [-1, 1]
@@ -293,14 +422,14 @@ class ActorHead(nn.Module):
         self,
         fused: torch.Tensor,
         action: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate log_prob and entropy for a batch of actions."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate log_prob, entropy, **and actor mean** for a batch of actions."""
         mu, log_std = self.forward(fused)
         std = log_std.exp()
         dist = Normal(mu, std)
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        return log_prob, entropy
+        return log_prob, entropy, mu
 
 
 # ---------------------------------------------------------------------------
@@ -309,10 +438,11 @@ class ActorHead(nn.Module):
 
 
 class CriticHead(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, input_dim: int | None = None):
         super().__init__()
+        _in = input_dim or (cfg.gru_hidden if cfg.gru_hidden > 0 else cfg.fast_hidden)
         self.net = nn.Sequential(
-            nn.Linear(cfg.fast_hidden, 64),
+            nn.Linear(_in, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
         )
@@ -338,7 +468,8 @@ class DronePolicy(nn.Module):
         Produces a visual-feature vector that is cached internally.
 
     **Fast path** — updated on every IMU tick:
-        ``FastStateEncoder``  (IMU + waypoints + cached visual feature)
+        ``RunningNormalizer``  (online zero-mean, unit-variance for IMU + waypoints)
+        → ``FastStateEncoder``  (MLP + optional GRU for temporal memory)
         → ``ActorHead``  (body-rate Gaussian policy)
         → ``CriticHead``  (V(s))
 
@@ -353,22 +484,52 @@ class DronePolicy(nn.Module):
         - ``"waypoints"`` : (B, 6) float32  [wp1_xyz, wp2_xyz]  — body frame
         - ``"vis_feat"``  : (B, flow_feature_dim) — *optional* at inference;
                             if omitted the internally cached features are used.
+        - ``"hidden"``    : (1, B, gru_hidden) — *optional* GRU hidden state;
+                            if omitted the internally cached hidden is used.
     """
 
     def __init__(self, cfg: ModelConfig | None = None):
         super().__init__()
         self.cfg = cfg or ModelConfig()
 
+        # ── Running observation normalizers ──────────────────────────────
+        self.imu_norm = RunningNormalizer(self.cfg.imu_dim)
+        wp_dim = self.cfg.waypoint_dim * self.cfg.num_waypoints
+        self.wp_norm = RunningNormalizer(wp_dim)
+
         # Slow path (camera rate)
         self.slow_visual = SlowVisualEncoder(self.cfg)
 
-        # Fast path (IMU rate)
+        # Fast path (IMU rate) — MLP + optional GRU
         self.fast_encoder = FastStateEncoder(self.cfg)
-        self.actor = ActorHead(self.cfg)
-        self.critic = CriticHead(self.cfg)
+        head_dim = self.fast_encoder.output_dim
+        self.actor = ActorHead(self.cfg, input_dim=head_dim)
+        self.critic = CriticHead(self.cfg, input_dim=head_dim)
 
         # Cached visual features — filled by update_vision(), consumed by act()
         self._vis_feat_cache: torch.Tensor | None = None
+
+        # Cached RAFT flow map — stored in rollout buffer so FlowEncoder
+        # can be re-run with gradients during PPO / BC updates.
+        self._flow_cache: torch.Tensor | None = None
+
+        # Cached GRU hidden state — carried across fast-path ticks
+        self._gru_hidden_cache: torch.Tensor | None = None
+
+    @property
+    def gru_hidden_dim(self) -> int:
+        """Dimensionality of the GRU hidden state (0 if GRU disabled)."""
+        return self.cfg.gru_hidden if self.fast_encoder.use_gru else 0
+
+    def init_hidden(self, batch_size: int = 1, device: str | torch.device = "cpu") -> torch.Tensor | None:
+        """Return a zero-initialised GRU hidden state, or None if GRU is disabled."""
+        if not self.fast_encoder.use_gru:
+            return None
+        return torch.zeros(1, batch_size, self.cfg.gru_hidden, device=device)
+
+    def reset_hidden(self) -> None:
+        """Clear the cached GRU hidden state (call on episode reset)."""
+        self._gru_hidden_cache = None
 
     def train(self, mode: bool = True):
         """Override: keep RAFT frozen in eval() mode at all times."""
@@ -389,6 +550,10 @@ class DronePolicy(nn.Module):
         Should be called once per camera frame.  Between camera frames the
         fast path reuses the cached feature vector.
 
+        Caches both the raw RAFT flow map (for later re-encoding with
+        gradients during PPO / BC updates) and the compressed vis_feat
+        (for fast-path action selection during rollout).
+
         Args:
             img_prev: (B, C, H, W) float32 in [0, 1]
             img_curr: (B, C, H, W) float32 in [0, 1]
@@ -396,7 +561,9 @@ class DronePolicy(nn.Module):
         Returns:
             vis_feat: (B, flow_feature_dim) — also stored in internal cache.
         """
-        vis_feat = self.slow_visual(img_prev, img_curr)
+        flow = self.slow_visual.compute_flow(img_prev, img_curr)
+        self._flow_cache = flow.detach()
+        vis_feat = self.slow_visual.encode_flow(flow)
         self._vis_feat_cache = vis_feat.detach()
         return vis_feat
 
@@ -419,10 +586,58 @@ class DronePolicy(nn.Module):
         device = obs["imu"].device
         return torch.zeros(B, self.cfg.flow_feature_dim, device=device)
 
-    def _encode_fast(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Run the fast-path encoder (IMU + waypoints + cached vis)."""
-        vis_feat = self._get_vis_feat(obs)
-        return self.fast_encoder(obs["imu"], obs["waypoints"], vis_feat)
+    def _get_hidden(
+        self,
+        obs: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Return GRU hidden state from obs or the internal cache."""
+        if not self.fast_encoder.use_gru:
+            return None
+        if "hidden" in obs and obs["hidden"] is not None:
+            return obs["hidden"]
+        return self._gru_hidden_cache
+
+    def _encode_fast(
+        self,
+        obs: dict[str, torch.Tensor],
+        update_norm: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the fast-path encoder (normalise → MLP → GRU).
+
+        Args:
+            obs: observation dict with ``imu``, ``waypoints``,
+                 and optionally ``vis_feat`` / ``hidden`` / ``flow``.
+                 When ``flow`` (B, 2, H, W) is provided, the trainable
+                 FlowEncoder is re-run with gradients to produce
+                 ``vis_feat``, enabling end-to-end training.
+            update_norm: if True, update running normalizer statistics
+                         (should be True during rollout, False during
+                         PPO update).
+
+        Returns:
+            fused:      (B, head_dim) — features for actor/critic heads.
+            new_hidden: (1, B, gru_hidden) or None — updated GRU state.
+        """
+        # If raw flow maps are provided (PPO/BC update), re-run the
+        # trainable FlowEncoder so gradients reach its weights.
+        if "flow" in obs and obs["flow"] is not None:
+            vis_feat = self.slow_visual.encode_flow(obs["flow"])
+        else:
+            vis_feat = self._get_vis_feat(obs)
+        hidden = self._get_hidden(obs)
+
+        # ── Normalise observations ────────────────────────────────────
+        imu = obs["imu"]
+        wp = obs["waypoints"]
+        if update_norm:
+            imu = self.imu_norm.update(imu)
+            wp = self.wp_norm.update(wp)
+        else:
+            imu = self.imu_norm.normalize(imu)
+            wp = self.wp_norm.normalize(wp)
+
+        fused, new_hidden = self.fast_encoder(imu, wp, vis_feat, hidden)
+        return fused, new_hidden
 
     # ----- public API (fast path — call at IMU rate) ----------------------
 
@@ -439,6 +654,9 @@ class DronePolicy(nn.Module):
         ``update_vision()`` has been called at least once with the latest
         camera frame pair before the first call.
 
+        Side-effect: updates the internal GRU hidden cache (if GRU enabled)
+        and the running normalizer statistics.
+
         Returns:
             action   : (B, 4) body-rate command  (fp32)
             log_prob : (B,)   log π(a|s)         (fp32)
@@ -450,7 +668,10 @@ class DronePolicy(nn.Module):
             dtype=torch.float16,
             enabled=(dev.type == "cuda"),
         ):
-            fused = self._encode_fast(obs)
+            fused, new_hidden = self._encode_fast(obs, update_norm=True)
+            # Cache the new hidden state for the next tick
+            if new_hidden is not None:
+                self._gru_hidden_cache = new_hidden
             value = self.critic(fused)
             if deterministic:
                 mu, _ = self.actor(fused)
@@ -458,20 +679,31 @@ class DronePolicy(nn.Module):
             action, log_prob = self.actor.sample(fused)
         return action.float(), log_prob.float(), value.float()
 
+    def get_hidden_state(self) -> torch.Tensor | None:
+        """Return the current cached GRU hidden state (for storage in buffer)."""
+        if self._gru_hidden_cache is not None:
+            return self._gru_hidden_cache.detach()
+        return None
+
     def evaluate_actions(
         self,
         obs: dict[str, torch.Tensor],
         actions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Re-evaluate stored transitions during PPO update.
 
         ``obs["vis_feat"]`` **must** be provided (stored from rollout).
+        ``obs["hidden"]`` should be provided when GRU is enabled (the
+        hidden state stored during rollout collection).
+
+        Normalizer stats are NOT updated here — only ``normalize()`` is called.
 
         Returns:
-            log_prob : (B,)    (fp32)
-            entropy  : (B,)    (fp32)
-            value    : (B, 1)  (fp32)
+            log_prob  : (B,)    (fp32)
+            entropy   : (B,)    (fp32)
+            value     : (B, 1)  (fp32)
+            actor_mu  : (B, 4)  (fp32) — deterministic actor mean
         """
         dev = obs["imu"].device
         with torch.amp.autocast(  # type: ignore[attr-defined]
@@ -479,10 +711,10 @@ class DronePolicy(nn.Module):
             dtype=torch.float16,
             enabled=(dev.type == "cuda"),
         ):
-            fused = self._encode_fast(obs)
-            log_prob, entropy = self.actor.evaluate(fused, actions)
+            fused, _ = self._encode_fast(obs, update_norm=False)
+            log_prob, entropy, mu = self.actor.evaluate(fused, actions)
             value = self.critic(fused)
-        return log_prob.float(), entropy.float(), value.float()
+        return log_prob.float(), entropy.float(), value.float(), mu.float()
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +915,11 @@ class DroneAgent:
         self._buffer = WaypointBuffer(route, self.cfg.safety_radius)
 
     def reset_vision(self) -> None:
-        """Clear cached visual state (call on episode reset)."""
+        """Clear cached visual and temporal state (call on episode reset)."""
         self._prev_frame = None
         self.policy._vis_feat_cache = None
+        self.policy._flow_cache = None
+        self.policy.reset_hidden()
 
     # ----- image helpers --------------------------------------------------
 
@@ -859,6 +1093,9 @@ class RolloutBuffer:
         device: str = "cpu",
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
+        gru_hidden_dim: int = 0,
+        flow_height: int = 0,
+        flow_width: int = 0,
     ):
         """
         Args:
@@ -870,21 +1107,47 @@ class RolloutBuffer:
             device:       "cpu" or "cuda".
             gamma:        Discount factor.
             gae_lambda:   GAE λ for bias–variance trade-off.
+            gru_hidden_dim: GRU hidden size (0 = no GRU state stored).
+            flow_height:  Height of RAFT flow maps (0 = don't store flow).
+            flow_width:   Width of RAFT flow maps (0 = don't store flow).
         """
         self.buffer_size = buffer_size
         self.device = torch.device(device)
         self.gamma = gamma
         self.gae_lambda = gae_lambda
+        self.gru_hidden_dim = gru_hidden_dim
 
         # ----- pre-allocate storage ------------------------------------------
         self.imu = torch.zeros(buffer_size, imu_dim, device=self.device)
         self.waypoints = torch.zeros(buffer_size, wp_dim, device=self.device)
         self.vis_feat = torch.zeros(buffer_size, vis_feat_dim, device=self.device)
         self.actions = torch.zeros(buffer_size, action_dim, device=self.device)
+        self.expert_actions = torch.zeros(buffer_size, action_dim, device=self.device)
         self.log_probs = torch.zeros(buffer_size, device=self.device)
         self.rewards = torch.zeros(buffer_size, device=self.device)
         self.values = torch.zeros(buffer_size, device=self.device)
         self.dones = torch.zeros(buffer_size, device=self.device)
+
+        # GRU hidden states (stored per-step for PPO re-evaluation)
+        if gru_hidden_dim > 0:
+            self.hidden_states = torch.zeros(
+                buffer_size, gru_hidden_dim, device=self.device
+            )
+        else:
+            self.hidden_states = None
+
+        # RAFT flow maps — stored on **CPU** to save GPU memory.
+        # During PPO/BC updates, mini-batches are moved to GPU on-the-fly
+        # so the trainable FlowEncoder can be re-run with gradients.
+        self.flow_height = flow_height
+        self.flow_width = flow_width
+        if flow_height > 0 and flow_width > 0:
+            self.flow_maps = torch.zeros(
+                buffer_size, 2, flow_height, flow_width,
+                device="cpu",
+            )
+        else:
+            self.flow_maps = None
 
         # ----- computed after finish() ---------------------------------------
         self.advantages = torch.zeros(buffer_size, device=self.device)
@@ -910,12 +1173,25 @@ class RolloutBuffer:
         reward: float,
         value: torch.Tensor,
         done: bool,
+        hidden: torch.Tensor | None = None,
+        flow: torch.Tensor | None = None,
+        expert_action: torch.Tensor | None = None,
     ) -> None:
         """
         Append a single transition.
 
         All tensor inputs should already be on ``self.device`` and have no
         batch dimension.
+
+        Args:
+            hidden: (gru_hidden_dim,) — GRU hidden state *before* this step.
+                    Required when ``gru_hidden_dim > 0``.
+            flow:   (2, H, W) — RAFT flow map for this step (stored on CPU).
+                    When provided, FlowEncoder is re-run with gradients
+                    during PPO / BC updates.
+            expert_action: (action_dim,) — action the expert PD controller
+                    would produce for this observation.  Used as the BC
+                    auxiliary anchor during PPO.
         """
         assert self.ptr < self.buffer_size, "Buffer full — call finish() then reset()."
 
@@ -924,10 +1200,16 @@ class RolloutBuffer:
         self.waypoints[i] = waypoints
         self.vis_feat[i] = vis_feat
         self.actions[i] = action
+        if expert_action is not None:
+            self.expert_actions[i] = expert_action
         self.log_probs[i] = log_prob
         self.rewards[i] = reward
         self.values[i] = value.squeeze()
         self.dones[i] = float(done)
+        if self.hidden_states is not None and hidden is not None:
+            self.hidden_states[i] = hidden
+        if self.flow_maps is not None and flow is not None:
+            self.flow_maps[i] = flow.detach().cpu()
         self.ptr += 1
 
         if self.ptr == self.buffer_size:
@@ -994,13 +1276,24 @@ class RolloutBuffer:
             end = min(start + batch_size, n)
             idx = indices[start:end]
 
+            obs_dict: dict[str, torch.Tensor] = {
+                "imu": self.imu[idx],
+                "waypoints": self.waypoints[idx],
+                "vis_feat": self.vis_feat[idx],
+            }
+            # Include stored RAFT flow maps so FlowEncoder can be
+            # re-run with gradients during PPO / BC updates.
+            if self.flow_maps is not None:
+                obs_dict["flow"] = self.flow_maps[idx.cpu()].to(self.device)
+            # Include stored GRU hidden states for re-evaluation
+            if self.hidden_states is not None:
+                # Stored as (B, gru_hidden) → policy expects (1, B, gru_hidden)
+                obs_dict["hidden"] = self.hidden_states[idx].unsqueeze(0)
+
             yield {
-                "obs": {
-                    "imu": self.imu[idx],
-                    "waypoints": self.waypoints[idx],
-                    "vis_feat": self.vis_feat[idx],
-                },
+                "obs": obs_dict,
                 "actions": self.actions[idx],
+                "expert_actions": self.expert_actions[idx],
                 "old_log_probs": self.log_probs[idx],
                 "advantages": self.advantages[idx],
                 "returns": self.returns[idx],
@@ -1022,11 +1315,10 @@ class PPOTrainer:
     the slow visual encoder is run and its output is cached / stored
     alongside the transition.
 
-    During the PPO update, only the **fast path** + actor/critic heads are
-    re-evaluated (the stored ``vis_feat`` is treated as a fixed input).
-    The ``FlowEncoder`` CNN is still updated via the gradients that flow
-    through the stored ``vis_feat`` produced during rollout (since we
-    call ``update_vision`` *with* gradients during ``collect_rollout``).
+    During the PPO update the **fast path** + actor/critic heads are
+    re-evaluated.  Raw RAFT flow maps stored in the rollout buffer are
+    re-encoded through the trainable ``FlowEncoder`` CNN **with gradients**,
+    so FlowEncoder is properly trained alongside the rest of the policy.
 
     Usage
     -----
@@ -1066,6 +1358,9 @@ class PPOTrainer:
             device=device,
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
+            gru_hidden_dim=agent.policy.gru_hidden_dim,
+            flow_height=self.cfg.cam_height,
+            flow_width=self.cfg.cam_width,
         )
 
         self.optimiser = torch.optim.Adam(
@@ -1120,6 +1415,12 @@ class PPOTrainer:
                     device=self.agent.device,
                 )
 
+            # Get cached RAFT flow map for FlowEncoder re-training
+            flow = self.agent.policy._flow_cache  # (1, 2, H, W) or None
+
+            # Snapshot GRU hidden state *before* act() updates it
+            pre_hidden = self.agent.policy.get_hidden_state()
+
             policy_obs = {
                 "imu": imu.unsqueeze(0),
                 "waypoints": wp_tensor,
@@ -1133,6 +1434,12 @@ class PPOTrainer:
             next_obs, reward, done, info = env.step(action_np)
 
             # --- store -------------------------------------------------------
+            # Flatten hidden (1, 1, H) → (H,) for buffer storage
+            hidden_flat = (
+                pre_hidden.squeeze(0).squeeze(0)
+                if pre_hidden is not None
+                else None
+            )
             self.buffer.store(
                 imu=imu,
                 waypoints=wp_tensor.squeeze(0),
@@ -1142,6 +1449,8 @@ class PPOTrainer:
                 reward=float(reward),
                 value=value,
                 done=done,
+                hidden=hidden_flat,
+                flow=flow.squeeze(0) if flow is not None else None,
             )
             total_reward += float(reward)
 
@@ -1197,7 +1506,7 @@ class PPOTrainer:
                 returns = batch["returns"]
 
                 # Re-evaluate under current policy
-                new_log_probs, entropy, values = self.agent.policy.evaluate_actions(
+                new_log_probs, entropy, values, _mu = self.agent.policy.evaluate_actions(
                     obs, actions
                 )
                 values = values.squeeze(-1)

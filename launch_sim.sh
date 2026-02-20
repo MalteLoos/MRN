@@ -6,7 +6,8 @@
 #
 #   Pane 0 — PX4 SITL  (Gazebo Harmonic, lockstep)
 #   Pane 1 — Micro XRCE-DDS Agent  (PX4 ↔ ROS 2 bridge)
-#   Pane 2 — MAVROS 2  (MAVLink ↔ ROS 2, /use_sim_time)
+#   Pane 2 — ros_gz_bridge  (Gazebo /clock → ROS 2 /clock)
+#   Pane 3 — DDS Pose Relay  (PX4 DDS → /px4/pose + TF)
 #
 # Usage:
 #   ./launch_sim.sh                        # defaults: gz_x500, domain 0, default world
@@ -14,7 +15,7 @@
 #   ./launch_sim.sh gz_x500 0 baylands      # custom model, domain & world/map
 #
 # Requirements: tmux, PX4 Autopilot, MicroXRCEAgent, ROS 2,
-#               MAVROS 2, Gazebo Harmonic
+#               Gazebo Harmonic, px4_msgs
 # ============================================================
 set -euo pipefail
 
@@ -24,15 +25,14 @@ ROS_DOMAIN_ID="${2:-0}"                         # ROS 2 domain isolation
 PX4_GZ_WORLD="${3:-tugbot_depot}"                    # Gazebo world / map name
 PX4_HOME="${PX4_HOME:-/opt/PX4-Autopilot}"      # PX4 source tree
 PX4_PARAMS_FILE="${PX4_PARAMS_FILE:-/workspace/px4.params}"  # QGC text format params
-SESSION="px4sim"                                # tmux session name
+SESSION="${SESSION:-px4sim}"                    # tmux session name
 DDS_PORT="8888"                                 # XRCE-DDS UDP port
-FCU_URL="udp://:14540@127.0.0.1:14557"         # MAVROS ↔ PX4 link
 
 # ── Lockstep & simulation-time knobs ──────────────────────
 #  PX4_SIM_SPEED_FACTOR=1 is real-time; >1 faster, <1 slower.
 #  Lockstep is the PX4 default with Gazebo; we export the var
 #  explicitly for clarity and to guard against overrides.
-PX4_SIM_SPEED_FACTOR="${PX4_SIM_SPEED_FACTOR:-5}"
+PX4_SIM_SPEED_FACTOR="${PX4_SIM_SPEED_FACTOR:-6}"
 
 # ── Preamble sourced inside every tmux pane ───────────────
 read -r -d '' PREAMBLE <<'SHELL' || true
@@ -68,7 +68,6 @@ info "  Model:              $PX4_MODEL"
 info "  World / map:        $PX4_GZ_WORLD"
 info "  ROS_DOMAIN_ID:      $ROS_DOMAIN_ID"
 info "  DDS port:           $DDS_PORT"
-info "  FCU URL:            $FCU_URL"
 info "  Lockstep:           ON (PX4 default w/ Gazebo)"
 info "  PX4_SIM_SPEED_FACTOR: $PX4_SIM_SPEED_FACTOR"
 info "  Params file:         $PX4_PARAMS_FILE"
@@ -148,24 +147,23 @@ ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.C
 " Enter
 
 # ============================================================
-# Pane 4 — MAVROS 2  (with /use_sim_time:=true)
+# Pane 4 — Gz Pose Relay  (Gazebo ground-truth → /px4/pose + TF)
 # ============================================================
-# use_sim_time makes MAVROS subscribe to /clock published by
-# Gazebo so that all TF stamps, message headers, and timeout
-# logic use simulation time — essential for lockstep.
+# Subscribes to Gazebo dynamic_pose/info via gz-transport
+# (same mechanism as the gym env) and publishes PoseStamped
+# + TF for RViz.  No NED→ENU conversion needed — Gazebo
+# already uses ENU.
 # ============================================================
 tmux split-window -t "$SESSION" -v \; \
     send-keys "\
 ${PREAMBLE}
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
 echo '──────────────────────────────────────────────────'
-echo '  🛰  MAVROS 2  (use_sim_time:=true)'
+echo '  📍  Gz Pose Relay  (use_sim_time:=true)'
 echo '──────────────────────────────────────────────────'
-echo 'Waiting 5 s for PX4 & DDS to settle …'
+echo 'Waiting 5 s for Gazebo to settle …'
 sleep 5
-ros2 launch mavros px4.launch \
-    fcu_url:=${FCU_URL} \
-    use_sim_time:=true
+python3 /workspace/src/dds_pose_relay.py --ros-args -p use_sim_time:=true -p world_name:=${PX4_GZ_WORLD} -p model_name:=x500_mono_cam_0
 " Enter
 
 # ============================================================
